@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[workspace]
+resolver = "2"
+members = [
+    "aawg-creds",
+    "btsvc-core",
+    "display-manager-control",
+    "dm-gles-window",
+    "extender-settings",
+    "file-checksum",
+    "h264-ts-mux",
+    "mpe-encoder-state",
+]
+
+[profile.release]
+opt-level = 2
+
+[profile.ship]
+inherits = "release"
+panic = "abort"

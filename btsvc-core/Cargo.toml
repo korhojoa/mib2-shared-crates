@@ -1,0 +1,16 @@
+[package]
+name = "btsvc-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Sans-IO core for btsvcd: report parsers, classification, state machine. No I/O, host-testable."
+
+[lib]
+path = "src/lib.rs"
+
+# Property tests are written as deterministic exhaustive sweeps (no rng, no
+# extra crates) so the tree stays dependency-free and `--locked`-reproducible.
+# If deeper fuzzing is wanted later, add `proptest`/`cargo-fuzz` here.
+
+# This crate is also built directly outside a consumer workspace.

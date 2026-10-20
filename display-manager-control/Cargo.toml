@@ -1,0 +1,13 @@
+[package]
+name = "display-manager-control"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "In-process control of the MIB2 DisplayManager (libdmdt_core's CDMDTInterface): declare contexts, switch displays"
+
+# Zero dependencies. Everything in libdmdt_core is reached through dlopen and
+# dlsym, so nothing links against the unit's libraries.
+
+[lib]
+name = "display_manager_control"

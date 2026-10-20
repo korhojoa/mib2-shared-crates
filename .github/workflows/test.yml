@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/korhojoa/qnx650-compiler@sha256:85f95b995d4b5dc2c323a6842c29b5c08652f34cc2288f6cc745534f5b2ecc7a
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        env:
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          case "$COMMIT_SHA" in ''|*[!0-9a-f]*) echo "Invalid commit ID" >&2; exit 1;; esac
+          [ "${#COMMIT_SHA}" -eq 40 ] || exit 1
+          git init .
+          git fetch --no-tags --depth=1 "$REPOSITORY_URL" "$COMMIT_SHA"
+          git checkout --detach FETCH_HEAD
+          [ "$(git rev-parse HEAD)" = "$COMMIT_SHA" ]
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Check and build all crates
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --offline --workspace --all-targets -- -D warnings
+          cargo clippy --locked --offline --workspace --lib --bins --target armv7-unknown-nto-qnx650 -- -D warnings
+          cargo test --locked --offline --workspace
+          cargo build --locked --offline --release --workspace --target armv7-unknown-nto-qnx650

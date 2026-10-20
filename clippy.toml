@@ -1,0 +1,2 @@
+msrv = "1.99.0"
+avoid-breaking-exported-api = true

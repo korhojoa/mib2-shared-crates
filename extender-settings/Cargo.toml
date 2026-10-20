@@ -1,0 +1,19 @@
+[package]
+name = "extender-settings"
+version = "0.2.0"
+edition = "2021"
+description = "Shared Android Auto and CarPlay settings model, stores and native reader API"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "extender_settings"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "android-auto-settings"
+path = "src/main.rs"
+
+[[bin]]
+name = "carplay-settings"
+path = "src/dio_main.rs"

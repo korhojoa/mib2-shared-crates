@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+message_file=$1
+subject=$(sed -n '1p' "$message_file")
+
+case "$subject" in
+    Merge\ *|Revert\ *|fixup\!\ *|squash\!\ *) exit 0 ;;
+esac
+
+fail() {
+    printf '%s\n' "commit-msg: $*" >&2
+    exit 1
+}
+
+[ -n "$subject" ] || fail "subject must not be empty"
+[ "${#subject}" -le 50 ] ||
+    fail "subject is ${#subject} characters; limit it to 50"
+
+first=$(printf '%s' "$subject" | cut -c1)
+case "$first" in
+    [A-Z]) ;;
+    *) fail "capitalize the subject line" ;;
+esac
+
+case "$subject" in
+    *.) fail "do not end the subject line with a period" ;;
+esac
+
+line_count=$(wc -l < "$message_file")
+if [ "$line_count" -gt 1 ]; then
+    second=$(sed -n '2p' "$message_file")
+    [ -z "$second" ] || fail "separate subject and body with a blank line"
+fi
+
+long_body_lines=$(awk 'NR > 2 && length($0) > 72 { print NR ":" length($0) }' "$message_file")
+[ -z "$long_body_lines" ] || {
+    printf '%s\n' "commit-msg: body lines exceed 72 characters:" >&2
+    printf '%s\n' "$long_body_lines" >&2
+    exit 1
+}
+
+exit 0

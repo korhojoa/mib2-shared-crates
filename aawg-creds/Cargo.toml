@@ -1,0 +1,12 @@
+[package]
+name = "aawg-creds"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The uap0 Wi-Fi AP credentials a wireless-AA handshake hands to the phone: read from env overrides and scraped from uaputl/ifconfig. Shared by btsvcd and the native BlueSDK path (aawg-creds bin -> /tmp/aawg_creds)."
+
+[lib]
+path = "src/lib.rs"
+
+# This crate is also built directly outside a consumer workspace.

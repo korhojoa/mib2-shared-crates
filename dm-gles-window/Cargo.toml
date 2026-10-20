@@ -1,0 +1,10 @@
+[package]
+name = "dm-gles-window"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "A MIB2 DisplayManager window (libdisplayinit) with an EGL/GLES2 surface, a shader program helper and a YUV 4:2:0 picture drawer, all reached through dlopen/dlsym"
+
+[lib]
+name = "dm_gles_window"

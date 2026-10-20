@@ -1,0 +1,14 @@
+[package]
+name = "h264-ts-mux"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# Deliberately ZERO dependencies, same policy as cluster-probe-rs: anyone with
+# the toolchain can build it, and nothing here needs a registry. The crate is
+# also #![no_std] with no `alloc` -- see src/lib.rs for why that is the whole
+# point rather than a flourish.
+
+[lib]
+name = "h264_ts_mux"
