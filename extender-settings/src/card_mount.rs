@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn the_card_is_the_ancestor_under_fs() {
         assert_eq!(
-            mount_point(Path::new("/fs/sdb0/lsd-extender")),
+            mount_point(Path::new("/fs/sdb0/settings-data")),
             Some(PathBuf::from("/fs/sdb0"))
         );
         assert_eq!(

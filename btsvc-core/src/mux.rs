@@ -9,8 +9,7 @@
 //! wire codec ONLY - no sockets, no ring, no allocation. Bytes arrive from the
 //! transport in arbitrary chunks, so `parse` is incremental over the caller's
 //! growing buffer, and `encode` writes into the caller's slice. The I/O and the
-//! per-stream policy (windows, teardown) live in the daemon shell (`aa_relay`),
-//! exactly as `socks.rs` is the codec and `pan_relay.rs` the shell.
+//! caller controls I/O, receive windows and stream teardown.
 //!
 //! Frame = `ver(1) type(1) stream(2, BE) len(2, BE) payload[len]`. `stream` is
 //! meaningless for `Ping`; the initiator of an `Open` owns the id. Odd ids are
@@ -24,7 +23,7 @@ pub const MUX_VER: u8 = 0x01;
 pub const HEADER_LEN: usize = 6;
 
 /// The `len` field is one `u16`, so a single frame's payload cannot exceed
-/// this. Larger transfers are split across `Data` frames by the shell.
+/// this. Larger transfers are split across `Data` frames by the caller.
 pub const MAX_PAYLOAD: usize = u16::MAX as usize;
 
 // Frame type discriminants (the `type` byte).
@@ -39,19 +38,19 @@ pub const T_AUTH: u8 = 0x08;
 
 /// One multiplexer frame, borrowing its payload from the parse buffer (sans-IO,
 /// no allocation). `Open`'s target is an untrusted `host:port` byte string the
-/// egress end resolves; the codec does not interpret it.
+/// receiving peer resolves. The codec does not interpret it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Frame<'a> {
     /// Open a stream to `target` (`b"host:port"`, the SOCKS CONNECT target).
     Open { stream: u16, target: &'a [u8] },
-    /// The egress connected; the stream is now relaying.
+    /// The receiving peer connected. The stream can carry data.
     OpenOk { stream: u16 },
     /// The connect failed; `rep` is the SOCKS reply code to hand back to the
     /// local client (`socks::REP_*`), so no second error vocabulary exists.
     OpenErr { stream: u16, rep: u8 },
     /// Stream payload in one direction.
     Data { stream: u16, bytes: &'a [u8] },
-    /// One half closed; after both halves close the id may be reused.
+    /// One direction closed. The stream ID becomes available after the two directions close.
     Close { stream: u16 },
     /// Keepalive / liveness probe. Carries no stream.
     Ping,
@@ -74,9 +73,7 @@ pub enum Frame<'a> {
 }
 
 /// `Auth` carries no stream of its own, so that field discriminates an
-/// announcement from an answer. Peers older than this ignored it and decoded
-/// every `T_AUTH` as an announcement, so an `AuthAck` reaching one reads as a
-/// plain `Auth` - which is why both ends must be updated together.
+/// announcement from an answer. Both peers must distinguish these values.
 pub const AUTH_ANNOUNCE: u16 = 0;
 pub const AUTH_ANSWER: u16 = 1;
 
@@ -192,7 +189,7 @@ pub fn encoded_len(frame: &Frame<'_>) -> usize {
 
 /// Encode `frame` into `out`, returning the byte count. `None` if `out` is too
 /// short OR the payload exceeds `MAX_PAYLOAD` (the `len` field would overflow) -
-/// the shell must split `Data`/`Open` payloads below that before calling.
+/// the caller must split `Data`/`Open` payloads below that before calling.
 pub fn encode(out: &mut [u8], frame: &Frame<'_>) -> Option<usize> {
     let (ty, stream, payload_len): (u8, u16, usize) = match frame {
         Frame::Open { stream, target } => (T_OPEN, *stream, target.len()),
@@ -300,7 +297,7 @@ mod tests {
         assert_eq!(&buf[..n], &[0x01, 0x01, 0x01, 0x02, 0x00, 0x02, b'a', b'b']);
     }
 
-    /// Feed a back-to-back stream of frames one byte at a time; the incremental
+    /// Feed consecutive frames one byte at a time. The incremental
     /// parser must reproduce exactly the frames a whole-buffer parse yields.
     #[test]
     fn chunked_delivery_byte_by_byte() {
@@ -349,7 +346,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    // Frame borrows the parse buffer; an owned key lets tests accumulate and
+    // Frame borrows the parse buffer. An owned key lets tests accumulate and
     // compare parsed frames after the borrow ends.
     type Key = (u8, u16, Vec<u8>, u32);
     fn key(f: &Frame<'_>) -> Key {
@@ -380,7 +377,7 @@ mod tests {
 
     #[test]
     fn fixed_size_types_reject_bad_length() {
-        // OpenOk/Close/Ping want len 0; OpenErr wants 1; Window wants 4.
+        // OpenOk/Close/Ping want len 0. OpenErr wants 1. Window wants 4.
         assert_eq!(
             parse(&[MUX_VER, T_OPEN_OK, 0, 1, 0, 1, 0xff]),
             Parsed::Err(MuxError::BadLength)
@@ -435,7 +432,7 @@ mod tests {
 
     #[test]
     fn oversize_payload_refused() {
-        // A Data payload at exactly MAX_PAYLOAD encodes; one over cannot.
+        // MAX_PAYLOAD bytes encode successfully. One more byte exceeds the frame limit.
         let big = vec![0u8; MAX_PAYLOAD + 1];
         let mut out = vec![0u8; MAX_PAYLOAD + HEADER_LEN + 8];
         assert_eq!(

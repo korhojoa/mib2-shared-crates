@@ -5,7 +5,7 @@
 //! relays each accepted CONNECT over smoltcp. This module is the wire codec
 //! only: bytes arrive from a TCP fd in arbitrary chunks, so parsing is an
 //! incremental state machine over the caller's growing buffer. IPv4 (ATYP 1)
-//! and domain (ATYP 3, resolved by the shell via the lease's DNS) targets are
+//! and domain (ATYP 3, resolved by the caller via the lease's DNS) targets are
 //! accepted; IPv6 (ATYP 4) is rejected with 0x08, non-CONNECT commands with
 //! 0x07. Per RFC 1928 the server closes after an error reply.
 
@@ -67,7 +67,7 @@ impl core::fmt::Debug for Domain {
     }
 }
 
-/// Parsed CONNECT target. Domain resolution is the shell's job.
+/// Parsed CONNECT target. Domain resolution is the caller's job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // Fixed inline storage keeps this no_std parser allocation-free.
 #[allow(clippy::large_enum_variant)]
@@ -500,7 +500,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod car_repro {
+mod fragmentation_tests {
     use super::*;
 
     /// A greeting and a request can arrive in one buffer.

@@ -29,10 +29,9 @@ pub struct IfaceConfig {
 /// The advertised MTU. The interface driver must accept frames of this size.
 pub const IFACE_MTU: u16 = 1500;
 
-/// Classful default for a lease that carried no option 1. RFC 2131 leaves
-/// the netmask optional and a few tethers really do omit it; guessing
-/// classfully is what every DHCP client on earth does in that case, and it is
-/// right for the 10/172.16/192.168 ranges phones hand out.
+/// Classful fallback when DHCP option 1 is absent. The first address byte
+/// selects an 8, 16 or 24 bit mask. This does not detect a subnet mask.
+/// Use a server supplied mask when it is available.
 #[must_use]
 pub fn classful_netmask(ip: [u8; 4]) -> [u8; 4] {
     match ip[0] {

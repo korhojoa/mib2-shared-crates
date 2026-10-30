@@ -63,30 +63,19 @@ fn pcr_encode(p: &mut [u8; 6], pcr90: u64) {
 /// consumer's stream.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PcrPlacement {
-    /// dio-extender's shape: a PCR-only packet opens every block
-    /// (`block_begin`), and every PCR in the block is RE-STAMPED with
-    /// `MuxIo::now90()` at the moment the block is emitted -- the decoder sees
-    /// transmit time. Regular 64-packet PCR spacing.
+    /// A PCR-only packet starts each block. Each PCR receives the transmission
+    /// timestamp from `MuxIo::now90()` when the block leaves the mux.
     BlockHead,
-    /// gal-extender's shape: the PCR rides the video PES-start packet, stamped
-    /// AT BUILD TIME with the `pcr90` handed to `send_video`, and is never
-    /// restamped -- `MuxIo::now90()` is not consulted at all. No bare PCR
-    /// packets; PCR spacing follows frame boundaries. gal's shipping stream is
-    /// this plus `pts_lead_ms = 0` (PTS == PCR).
+    /// The video PES-start packet carries the supplied `pcr90` timestamp.
+    /// This mode does not read `MuxIo::now90()` or add PCR-only packets.
+    /// PCR spacing follows frame boundaries. A zero `pts_lead_ms` makes PTS equal PCR.
     PesStart,
 }
 
-/// The consumer's side of the seam: the transmission clock and the wire.
-///
-/// `now90` is read once per finished block, at the moment the block is
-/// finalised, and stamped into every PCR slot in it -- that is what makes the
-/// PCR the decoder sees the TRANSMIT time rather than the build time. The
-/// consumer decides what clock that is (wall, virtual for --fast replays,
-/// or whatever the shim's pacing uses).
-///
-/// `emit` always receives exactly `TS_BLOCK_SIZE` bytes: a partial block has
-/// already been padded with null packets, because the MOST driver takes whole
-/// 12032-byte blocks only -- a short write is an EMSGSIZE, not a picture.
+/// The caller supplies the transmission clock and the output transport.
+/// `BlockHead` reads `now90` once when a block is complete and stamps each PCR slot.
+/// `PesStart` uses the timestamp supplied to `send_video` instead.
+/// `emit` receives exactly `TS_BLOCK_SIZE` bytes. Null packets fill a partial block.
 pub trait MuxIo {
     /// 90 kHz transmission clock.
     fn now90(&mut self) -> u64;
@@ -101,8 +90,7 @@ pub struct Mux {
     pcr_n: usize,
     cc: [u8; 8192],
     last_video_cc: u8,
-    /// PTS = PCR + this lead, in ms. Format, not policy: it is baked into the
-    /// PES header bytes and must match what the shipping muxer writes.
+    /// PTS equals PCR plus this offset in milliseconds. The PES header carries the result.
     pub pts_lead_ms: u64,
     /// See [`PcrPlacement`]. The default is `BlockHead`.
     pub pcr_placement: PcrPlacement,
@@ -349,8 +337,7 @@ impl Mux {
     ///
     /// Under `PcrPlacement::PesStart` the FIRST fragment also carries the PCR
     /// (stamped from `pcr90`, final), which costs 8 bytes of adaptation field
-    /// and shrinks its H.264 payload from 170 to 162 bytes -- gal-extender's
-    /// measured shipping shape. Under `BlockHead` the PES start carries no PCR
+    /// and reduces its H.264 payload from 170 to 162 bytes. Under `BlockHead` the PES start carries no PCR
     /// and the block-head packet is stamped at emission instead.
     pub fn send_video(&mut self, io: &mut dyn MuxIo, au: &[u8], pcr90: u64) {
         let pts90 = pcr90.wrapping_add(self.pts_lead_ms.wrapping_mul(90));
@@ -604,8 +591,7 @@ mod tests {
     }
 
     /// PTS is pcr90 + the configured lead, packed into the PES header. The
-    /// probe's virtual-clock property (--fast) is now a consumer property built
-    /// on this one: whoever supplies pcr90 supplies the timeline.
+    /// caller selects the timeline through the supplied `pcr90` values.
     #[test]
     fn pts_is_pcr90_plus_the_configured_lead() {
         let v = mux_to_bytes(|m, io| {
@@ -637,7 +623,7 @@ mod tests {
     /// The expected CRC is fixed independently of this function. The section
     /// contains protocol fields only, with no device or person identifiers.
     #[test]
-    fn psi_crc_matches_the_shipping_muxers_own_stream() {
+    fn psi_crc_matches_the_reference_stream() {
         let tab = crc32_table();
         let pat = [
             0x00u8, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xE1, 0x00,

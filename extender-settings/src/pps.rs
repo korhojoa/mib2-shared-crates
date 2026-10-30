@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! The QNX PPS object that carries gal's live settings status
-//! (`/ramdisk/pps/gal/settings_active`; gal-extender `docs/PPS_IPC.md`). The
-//! same format as gal-extender's `gal_feature_api::pps`, kept here because
-//! this crate is self-contained: one write of `attr::value` lines on a
-//! descriptor opened without truncation (a truncating open deletes every
-//! attribute first), `-attr` lines deleting what the previous write had and
-//! this one lacks, and a reader that takes `name:<encoding>:value` lines and
-//! skips the `@object` line and the deletions.
+//! Atomic attribute updates for QNX PPS objects.
+//! One write sends `attr::value` lines without truncation.
+//! `-attr` deletes an attribute absent from the next record.
+//! The reader accepts `name:<encoding>:value` and ignores object headers and deletions.
+//! The destination must be a PPS object. A regular file does not have these update semantics.
 
 use std::io::{Read as _, Write as _};
 
@@ -36,6 +33,11 @@ pub fn attrs(text: &str) -> impl Iterator<Item = (&str, &str)> {
 /// `-name` and anything else.
 pub fn attr(line: &str) -> Option<(&str, &str)> {
     let line = line.strip_suffix('\r').unwrap_or(line);
+    let line = if line.starts_with('[') {
+        line.split_once(']')?.1
+    } else {
+        line
+    };
     let first = line.find(':')?;
     if first == 0 || line.starts_with('@') || line.starts_with('-') {
         return None;
@@ -131,11 +133,15 @@ mod tests {
             ]
         );
         assert_eq!(
-            attr("dir::/fs/sdb0/lsd-extender"),
-            Some(("dir", "/fs/sdb0/lsd-extender"))
+            attr("dir::/fs/sdb0/settings-data"),
+            Some(("dir", "/fs/sdb0/settings-data"))
         );
         assert_eq!(attr("error::a: b"), Some(("error", "a: b")));
         assert_eq!(attr("pid=1"), None);
+        assert_eq!(
+            attr("[n]live.sensor_send_compass::1"),
+            Some(("live.sensor_send_compass", "1"))
+        );
     }
 
     #[test]

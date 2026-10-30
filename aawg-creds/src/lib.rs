@@ -4,14 +4,13 @@
 //!
 //! Callers can read credentials in-process or publish them to `CREDS_PPS`.
 //! A Bluetooth process can read this QNX PPS object without starting a child
-//! process. A separate credential publisher is not released yet. One PPS
-//! write updates all attributes atomically.
+//! process. One PPS write updates all attributes atomically.
 //!
 //! Sources, in order: environment overrides (`AAWG_IP`, `AAWG_PORT`,
 //! `AAWG_SSID`, `AAWG_KEY`, `AAWG_KEY_FILE`, `AAWG_BSSID`), then the live AP
 //! (`uaputl -i uap0 ...` and `ifconfig uap0`), only for fields still empty.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// The PPS directory and object the native path reads (the unit mounts PPS
 /// at /ramdisk/pps). Opened with `?nopersist`: the values are live AP state.
@@ -70,11 +69,11 @@ impl Creds {
 
     fn connection_fields(&self) -> [(&'static str, bool); 5] {
         [
-            ("ip", !self.ip.is_empty()),
+            ("ip", valid_field(&self.ip)),
             ("port", self.port != 0),
-            ("ssid", !self.ssid.is_empty()),
-            ("key", !self.key.is_empty()),
-            ("bssid", !self.bssid.is_empty()),
+            ("ssid", valid_field(&self.ssid)),
+            ("key", valid_field(&self.key)),
+            ("bssid", valid_field(&self.bssid)),
         ]
     }
 
@@ -100,16 +99,14 @@ impl Creds {
         let iface = std::env::var("AAWG_UAP_IF").unwrap_or_else(|_| "uap0".into());
         let mut notes = Vec::new();
         if self.ssid.is_empty() {
-            if let Some(v) = scrape_cmd(
-                &format!("{} -i {} sys_cfg_ssid 2>/dev/null", uaputl, iface),
-                "SSID = ",
-            ) {
+            if let Some(v) = scrape_cmd(&uaputl, &["-i", &iface, "sys_cfg_ssid"], "SSID = ") {
                 self.ssid = v;
             }
         }
         if self.key.is_empty() {
             if let Some(v) = scrape_cmd(
-                &format!("{} -i {} sys_cfg_wpa_passphrase 2>/dev/null", uaputl, iface),
+                &uaputl,
+                &["-i", &iface, "sys_cfg_wpa_passphrase"],
                 "WPA passphrase = ",
             ) {
                 self.key = v;
@@ -120,11 +117,8 @@ impl Creds {
             // broadcast MAC. The ifconfig interface MAC is not guaranteed to be
             // the broadcast BSSID on the Marvell uAP, so prefer uaputl's own AP
             // MAC (bss_config), fall back to ifconfig, and say which was used.
-            let ap_mac = scrape_mac(
-                &format!("{} -i {} bss_config 2>/dev/null", uaputl, iface),
-                "ap mac",
-            );
-            let if_mac = scrape_cmd(&format!("ifconfig {} 2>/dev/null", iface), "address: ");
+            let ap_mac = scrape_mac(&uaputl, &["-i", &iface, "bss_config"], "ap mac");
+            let if_mac = scrape_cmd("ifconfig", &[&iface], "address: ");
             if let Some(m) = ap_mac {
                 notes.push(format!(
                     "bssid={} (uaputl bss_config AP MAC; ifconfig address={})",
@@ -143,7 +137,7 @@ impl Creds {
         if self.ip.is_empty() {
             // uap0's own IPv4 is the endpoint handed to the phone; "inet " with
             // the trailing space does not match "inet6".
-            if let Some(v) = scrape_cmd(&format!("ifconfig {} 2>/dev/null", iface), "inet ") {
+            if let Some(v) = scrape_cmd("ifconfig", &[&iface], "inet ") {
                 if let Some(ip) = v.split_whitespace().next() {
                     self.ip = ip.to_string();
                 }
@@ -154,7 +148,14 @@ impl Creds {
 
     /// The PPS update: one `attr:encoding:value` line per field. Written with a
     /// single write(), so a reader sees all of it or none of it.
+    /// A line break or NUL in a field produces an empty, incomplete record.
     pub fn to_pps(&self) -> String {
+        if [&self.ip, &self.ssid, &self.key, &self.bssid]
+            .iter()
+            .any(|field| field.contains(['\n', '\r', '\0']))
+        {
+            return Creds::default().to_pps();
+        }
         format!(
             "ip::{}\nport:n:{}\nssid::{}\nkey::{}\nbssid::{}\ncomplete:b:{}\n",
             self.ip,
@@ -171,11 +172,12 @@ impl Creds {
     /// for anything that is not a PPS object read.
     pub fn parse_pps(text: &str) -> Option<Self> {
         let mut lines = text.lines();
-        if !lines.next()?.starts_with('@') {
+        if !btsvc_core::pps::content(lines.next()?)?.starts_with('@') {
             return None;
         }
         let mut c = Creds::default();
         for line in lines {
+            let line = btsvc_core::pps::content(line)?;
             let Some((name, rest)) = line.split_once(':') else {
                 continue;
             };
@@ -195,10 +197,18 @@ impl Creds {
     }
 }
 
+fn valid_field(value: &str) -> bool {
+    !value.is_empty() && !value.contains(['\n', '\r', '\0'])
+}
+
 // std::process::Command uses posix_spawn on QNX.
 // Do not fork from a multithreaded process.
-fn scrape_cmd(cmd: &str, marker: &str) -> Option<String> {
-    let out = Command::new("/bin/sh").arg("-c").arg(cmd).output().ok()?;
+fn scrape_cmd(program: &str, args: &[&str], marker: &str) -> Option<String> {
+    let out = Command::new(program)
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
     first_marked(&String::from_utf8_lossy(&out.stdout), marker)
 }
 
@@ -249,8 +259,12 @@ fn first_mac(line: &str) -> Option<String> {
 /// First real MAC in a command's output. Lines containing `label` (matched
 /// case-insensitively) are searched first, then any line. Robust to the exact
 /// uaputl label wording, which is not pinned down.
-fn scrape_mac(cmd: &str, label: &str) -> Option<String> {
-    let out = Command::new("/bin/sh").arg("-c").arg(cmd).output().ok()?;
+fn scrape_mac(program: &str, args: &[&str], label: &str) -> Option<String> {
+    let out = Command::new(program)
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
     mac_in_text(&String::from_utf8_lossy(&out.stdout), label)
 }
 
@@ -330,6 +344,15 @@ mod tests {
     }
 
     #[test]
+    fn qualified_object_and_attributes_keep_literal_credentials() {
+        let text = "[n]@creds\nbssid::02:00:00:00:00:01\ncomplete:b:true\nip::198.51.100.1\n[n]key::fake-passphrase\nport:n:5288\nssid::test-ap\n";
+        let creds = Creds::parse_pps(text).unwrap();
+        assert!(creds.complete());
+        assert_eq!(creds.key, "fake-passphrase");
+        assert_eq!(creds.port, 5288);
+        assert!(Creds::parse_pps("[n@creds\nkey::invalid\n").is_none());
+    }
+    #[test]
     fn pps_round_trips_and_needs_header() {
         let c = Creds {
             ip: "192.0.2.1".into(),
@@ -377,5 +400,69 @@ mod tests {
         assert_eq!(c.key_form(), "raw-psk(64hex)");
         c.key = "hello world".into();
         assert_eq!(c.key_form(), "passphrase");
+    }
+    #[test]
+    fn pps_credentials_cannot_add_attributes_with_line_breaks() {
+        for newline in ["\n", "\r", "\0"] {
+            let mut creds = complete_creds();
+            creds.ssid = format!("name{newline}complete:b:true");
+            let encoded = creds.to_pps();
+            let parsed = Creds::parse_pps(&format!("@creds\n{encoded}")).unwrap();
+            assert!(!parsed.complete());
+            assert_eq!(
+                encoded
+                    .lines()
+                    .filter(|line| line.starts_with("complete:"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uap_command_preserves_literal_program_and_interface_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Fixture {
+            dir: std::path::PathBuf,
+            env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                for (key, value) in &self.env {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "aawg-args-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let fixture = Fixture {
+            dir,
+            env: ["AAWG_UAPUTL", "AAWG_UAP_IF"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        };
+        let program = fixture.dir.join("uap tool");
+        std::fs::write(&program, b"#!/bin/sh\n[ \"$1\" = -i ] || exit 3\n[ \"$3\" = sys_cfg_ssid ] || exit 4\necho \"SSID = $2\"\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::env::set_var("AAWG_UAPUTL", &program);
+        std::env::set_var("AAWG_UAP_IF", "uap0; exit 7");
+        let mut creds = complete_creds();
+        creds.ssid.clear();
+        creds.fill_from_uap();
+        assert_eq!(creds.ssid, "uap0; exit 7");
     }
 }

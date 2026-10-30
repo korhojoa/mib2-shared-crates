@@ -4,7 +4,10 @@ version = 4
 
 [[package]]
 name = "aawg-creds"
-version = "0.1.0"
+version = "0.1.1"
+dependencies = [
+ "btsvc-core",
+]
 
 [[package]]
 name = "block-buffer"
@@ -64,7 +67,10 @@ version = "0.1.0"
 
 [[package]]
 name = "extender-settings"
-version = "0.2.0"
+version = "0.3.4+1"
+dependencies = [
+ "qnx-slog",
+]
 
 [[package]]
 name = "file-checksum"
@@ -89,13 +95,32 @@ version = "0.1.0"
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "mpe-encoder-state"
 version = "0.1.0"
+
+[[package]]
+name = "qnx-dl"
+version = "0.1.0"
+source = "git+https://github.com/korhojoa/qnx650-crates.git?rev=fa8dd2a4c9c19212bf7c868f375eee2bc6534ecb#fa8dd2a4c9c19212bf7c868f375eee2bc6534ecb"
+
+[[package]]
+name = "qnx-slog"
+version = "0.3.0"
+source = "git+https://github.com/korhojoa/qnx650-crates.git?rev=fa8dd2a4c9c19212bf7c868f375eee2bc6534ecb#fa8dd2a4c9c19212bf7c868f375eee2bc6534ecb"
+dependencies = [
+ "qnx-dl",
+ "qnx-time",
+]
+
+[[package]]
+name = "qnx-time"
+version = "0.1.0"
+source = "git+https://github.com/korhojoa/qnx650-crates.git?rev=fa8dd2a4c9c19212bf7c868f375eee2bc6534ecb#fa8dd2a4c9c19212bf7c868f375eee2bc6534ecb"
 
 [[package]]
 name = "sha2"

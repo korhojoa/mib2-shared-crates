@@ -5,6 +5,7 @@
 //!
 //! Initialization creates ErrorStorage, Osal and a DMRCClient AgentStarter,
 //! then connects the display interface. Initialization runs once per process.
+//! The interface remains connected for the process lifetime. No disconnect symbol is required.
 //!
 //! Display zero is the head-unit panel. Display four is the instrument cluster.
 //! Navigation uses cluster context 70. Callers must not redeclare that context.
@@ -72,7 +73,7 @@ struct Dm {
 
 static DM: OnceLock<Result<Dm, String>> = OnceLock::new();
 
-const NAMES: [&CStr; 12] = [
+const NAMES: [&CStr; 11] = [
     c"_ZN3ipl12ErrorStorage21action_dump_to_stdoutEPvPKcPKNS_11ErrorObjectEj",
     c"_ZN3ipl12ErrorStorageC1EPFvPvPKcPKNS_11ErrorObjectEjE",
     c"_ZN4osal4OsalC1Ebb",
@@ -84,7 +85,6 @@ const NAMES: [&CStr; 12] = [
     c"_ZN14CDMDTInterface7connectEv",
     c"_ZN14CDMDTInterface14declareContextEiPii",
     c"_ZN14CDMDTInterface13switchContextEii",
-    c"_ZN14CDMDTInterface10disconnectEv",
 ];
 
 /// # Safety
@@ -92,6 +92,14 @@ const NAMES: [&CStr; 12] = [
 unsafe fn func<T: Copy>(a: usize) -> T {
     // SAFETY: forwarded to the caller.
     unsafe { std::mem::transmute_copy::<usize, T>(&a) }
+}
+
+fn resolve_symbols(mut lookup: impl FnMut(&CStr) -> usize) -> Result<Vec<usize>, String> {
+    let addresses: Vec<_> = NAMES.iter().map(|name| lookup(name)).collect();
+    if let Some(i) = addresses.iter().position(|&v| v == 0) {
+        return Err(format!("missing symbol {}", NAMES[i].to_string_lossy()));
+    }
+    Ok(addresses)
 }
 
 fn bootstrap() -> Result<Dm, String> {
@@ -102,22 +110,16 @@ fn bootstrap() -> Result<Dm, String> {
     }
     // Search the library and its dependencies before the global namespace.
     // A standalone process can have fewer global symbols than dio_manager.
-    let a: Vec<usize> = NAMES
-        .iter()
-        .map(|n| {
-            // SAFETY: valid handles and NUL-terminated names.
-            let v = unsafe { dlsym(h, n.as_ptr()) } as usize;
-            if v != 0 {
-                v
-            } else {
-                // SAFETY: as above.
-                unsafe { dlsym(RTLD_DEFAULT, n.as_ptr()) as usize }
-            }
-        })
-        .collect();
-    if let Some(i) = a.iter().position(|&v| v == 0) {
-        return Err(format!("missing symbol {}", NAMES[i].to_string_lossy()));
-    }
+    let a = resolve_symbols(|n| {
+        // SAFETY: valid handles and NUL-terminated names.
+        let v = unsafe { dlsym(h, n.as_ptr()) } as usize;
+        if v != 0 {
+            v
+        } else {
+            // SAFETY: as above.
+            unsafe { dlsym(RTLD_DEFAULT, n.as_ptr()) as usize }
+        }
+    })?;
     // SAFETY: each exported symbol has the function signature declared above.
     unsafe {
         func::<ErrCtor>(a[1])(ERRSTORE.p(), func::<Handler>(a[0]));
@@ -231,5 +233,17 @@ mod tests {
                 Call::Switch(IFACE.p() as usize, 0, -9),
             ]
         );
+    }
+    #[test]
+    fn context_control_resolves_without_an_unused_disconnect() {
+        let result = resolve_symbols(|name| {
+            if name.to_bytes().ends_with(b"10disconnectEv") {
+                0
+            } else {
+                1
+            }
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(resolve_symbols(|_| 0).is_err());
     }
 }

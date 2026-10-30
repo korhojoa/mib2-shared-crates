@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Keyboard and mouse report processing with press and release detection.
 //!
-//! The shell drives `BTstack`'s descriptor HID parser to turn a raw
-//! report into a list of [`HidField`] `(usage_page, usage, value)` tuples; this
-//! module turns those into keyboard/mouse EVENTS (press/release edges, relative
-//! motion, wheel), which the shell pushes into the `/hidkbm-*` shm ring. Keeping
-//! the edge detection here makes it `cargo test`-able without a device.
+//! The caller decodes HID fields into [`HidField`] values.
+//! This module emits keyboard edges, mouse buttons, motion and wheel events.
+//! Motion and wheel totals saturate at the `i16` limits.
 
 /// One parsed HID field from a report (`BTstack` `btstack_hid_parser_get_field`).
 #[derive(Debug, Clone, Copy)]
@@ -15,7 +13,7 @@ pub struct HidField {
     pub value: i32,
 }
 
-/// A keyboard/mouse event - maps 1:1 onto `hidinput_ev_t` kinds.
+/// A keyboard or mouse event value. The caller selects its output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KbmEvent {
     /// Keyboard key edge. `code` = HID keyboard usage (== SDL scancode).
@@ -53,14 +51,13 @@ impl KbmConn {
     }
 
     /// Process one input report's parsed fields, emitting the resulting
-    /// keyboard/mouse events. Port of `kbm_handle_report` (minus the
-    /// Home-hold launcher hook, which is a separate concern).
+    /// keyboard and mouse events. Repeated held keys do not produce new edges.
     pub fn process(&mut self, fields: &[HidField], out: &mut impl FnMut(KbmEvent)) {
         let mut mods = 0u8;
         let mut keys = [0u8; 16];
         let mut nkeys = 0usize;
         let mut btns = 0u8;
-        let (mut dx, mut dy, mut wh, mut pan) = (0i32, 0i32, 0i32, 0i32);
+        let (mut dx, mut dy, mut wh, mut pan) = (0i64, 0i64, 0i64, 0i64);
         let (mut saw_kbd, mut saw_xy, mut saw_btn) = (false, false, false);
 
         for f in fields {
@@ -81,21 +78,21 @@ impl KbmConn {
                     // generic desktop
                     match f.usage {
                         0x30 => {
-                            dx += f.value;
+                            dx = dx.saturating_add(i64::from(f.value));
                             saw_xy = true;
                         }
                         0x31 => {
-                            dy += f.value;
+                            dy = dy.saturating_add(i64::from(f.value));
                             saw_xy = true;
                         }
-                        0x38 => wh += f.value, // wheel
+                        0x38 => wh = wh.saturating_add(i64::from(f.value)), // wheel
                         _ => {}
                     }
                 }
                 0x0C => {
                     // consumer page - AC Pan (horizontal scroll)
                     if f.usage == 0x238 {
-                        pan += f.value;
+                        pan = pan.saturating_add(i64::from(f.value));
                     }
                 }
                 0x09 => {
@@ -136,15 +133,15 @@ impl KbmConn {
             self.btns = btns;
             if dx != 0 || dy != 0 {
                 out(KbmEvent::MMotion {
-                    dx: i16::from_le_bytes([dx.to_le_bytes()[0], dx.to_le_bytes()[1]]),
-                    dy: i16::from_le_bytes([dy.to_le_bytes()[0], dy.to_le_bytes()[1]]),
+                    dx: motion_value(dx),
+                    dy: motion_value(dy),
                 });
             }
         }
         if wh != 0 || pan != 0 {
             out(KbmEvent::MWheel {
-                dx: i16::from_le_bytes([pan.to_le_bytes()[0], pan.to_le_bytes()[1]]),
-                dy: i16::from_le_bytes([wh.to_le_bytes()[0], wh.to_le_bytes()[1]]),
+                dx: motion_value(pan),
+                dy: motion_value(wh),
             });
         }
     }
@@ -182,6 +179,10 @@ impl KbmConn {
         self.keys[..nkeys].copy_from_slice(&keys[..nkeys]);
         self.nkeys = nkeys;
     }
+}
+
+fn motion_value(value: i64) -> i16 {
+    value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
 }
 
 #[cfg(test)]
@@ -284,5 +285,33 @@ mod tests {
         // usage 0x01 = ErrorRollOver - must not be treated as a key
         let ev = run(&mut c, &[f(0x07, 0x01, 1)]);
         assert!(!ev.iter().any(|e| matches!(e, KbmEvent::Key { .. })));
+    }
+    #[test]
+    fn motion_and_wheel_saturate_without_changing_normal_values() {
+        let mut connection = KbmConn::new();
+        for (value, expected) in [
+            (5, 10),
+            (-7, -14),
+            (30_000, i16::MAX),
+            (-30_000, i16::MIN),
+            (i32::MAX, i16::MAX),
+            (i32::MIN, i16::MIN),
+        ] {
+            let fields = [
+                f(1, 0x30, value),
+                f(1, 0x30, value),
+                f(1, 0x38, value),
+                f(1, 0x38, value),
+            ];
+            let events = run(&mut connection, &fields);
+            assert!(events.contains(&KbmEvent::MMotion {
+                dx: expected,
+                dy: 0
+            }));
+            assert!(events.contains(&KbmEvent::MWheel {
+                dx: 0,
+                dy: expected
+            }));
+        }
     }
 }

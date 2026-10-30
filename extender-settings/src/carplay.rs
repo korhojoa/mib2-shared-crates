@@ -6,10 +6,6 @@ use std::{collections::BTreeMap, path::Path};
 pub const BEGIN: &str = "# carplay-settings overrides v1\n";
 pub const END: &str = "# end carplay-settings overrides\n";
 const MARKER: &str = "carplay-settings overrides";
-// Read these delimiters for compatibility only.
-const LEGACY_BEGIN: &str = "# lsd-extender CarPlay overrides v1\n";
-const LEGACY_END: &str = "# end lsd-extender CarPlay overrides\n";
-const LEGACY_MARKER: &str = "lsd-extender CarPlay overrides";
 pub const LIMIT: usize = 65534;
 
 const fn field(
@@ -213,13 +209,7 @@ impl Snapshot {
         if text.len() > LIMIT || text.contains('\0') {
             return Err("config exceeds native limits".into());
         }
-        let section = text
-            .strip_prefix(BEGIN)
-            .map(|rest| (rest, END))
-            .or_else(|| {
-                text.strip_prefix(LEGACY_BEGIN)
-                    .map(|rest| (rest, LEGACY_END))
-            });
+        let section = text.strip_prefix(BEGIN).map(|rest| (rest, END));
         let (base, overrides) = if let Some((rest, end)) = section {
             let (body, base) = rest
                 .split_once(end)
@@ -244,7 +234,7 @@ impl Snapshot {
         } else {
             (text.clone(), BTreeMap::new())
         };
-        if base.contains(MARKER) || base.contains(LEGACY_MARKER) {
+        if base.contains(MARKER) {
             return Err("unsupported or misplaced CarPlay override section".into());
         }
         Ok(Self {
@@ -401,7 +391,7 @@ impl Snapshot {
 pub use carplay_store::{commit, load, load_present};
 
 /// The resolved configuration path.
-pub fn absent_text(_argument: &str, path: &Path) -> String {
+pub fn absent_text(path: &Path) -> String {
     path.display().to_string()
 }
 
@@ -419,9 +409,9 @@ mod loader_semantics {
     use super::*;
 
     #[test]
-    fn legacy_section_reads_and_next_edit_uses_current_delimiters() {
+    fn managed_section_round_trips_with_the_writer_delimiters() {
         let base = "altscreen\ncluster\ncluster_output=1\n";
-        let original = format!("{LEGACY_BEGIN}altscreen_max_fps=30\n{LEGACY_END}{base}");
+        let original = format!("{BEGIN}altscreen_max_fps=30\n{END}{base}");
         let snapshot = Snapshot::parse(original.clone()).unwrap();
         assert_eq!(snapshot.base, base);
         assert_eq!(snapshot.overrides.get("altscreen_max_fps"), Some(&30));
@@ -430,7 +420,6 @@ mod loader_semantics {
             .unwrap();
         assert!(updated.starts_with(BEGIN));
         assert!(updated.contains(END));
-        assert!(!updated.contains(LEGACY_MARKER));
         assert_eq!(
             base_int(&original, "altscreen_max_fps", 0),
             base_int(&updated, "altscreen_max_fps", 0)
@@ -440,13 +429,8 @@ mod loader_semantics {
 
     #[test]
     fn section_delimiters_cannot_be_mixed_or_repeated() {
-        for (begin, end) in [(BEGIN, LEGACY_END), (LEGACY_BEGIN, END)] {
-            assert!(Snapshot::parse(format!("{begin}cluster_width=800\n{end}")).is_err());
-        }
-        for marker in [BEGIN, LEGACY_BEGIN] {
-            assert!(Snapshot::parse(format!("cluster\n{marker}")).is_err());
-            assert!(Snapshot::parse(format!("{BEGIN}{END}{marker}")).is_err());
-        }
+        assert!(Snapshot::parse(format!("cluster\n{BEGIN}")).is_err());
+        assert!(Snapshot::parse(format!("{BEGIN}{END}{BEGIN}")).is_err());
     }
 
     #[test]

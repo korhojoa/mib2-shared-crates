@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Execute copied helpers from three independent install folders.
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -15,11 +16,24 @@ fn answer(executable: &Path, args: &[&str], cwd: &Path) -> String {
     let mut child = Command::new(executable)
         .args(args)
         .current_dir(cwd)
-        .env_remove("LSD_SETTINGS_HMI_PID")
+        .env_remove("EXTENDER_SETTINGS_PARENT_PID")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drain both pipes while the helper runs. A complete descriptor answer
+    // can exceed a pipe buffer; waiting first prevents that helper from exiting.
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let read = |pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.take(131073).read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let out = read(Box::new(stdout));
+    let err = read(Box::new(stderr));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if child.try_wait().unwrap().is_some() {
@@ -28,17 +42,33 @@ fn answer(executable: &Path, args: &[&str], cwd: &Path) -> String {
         if Instant::now() >= deadline {
             child.kill().unwrap();
             child.wait().unwrap();
+            out.join().unwrap();
+            err.join().unwrap();
             panic!("copied settings helper exceeded the test deadline");
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let status = child.wait().unwrap();
+    let stdout = out.join().unwrap();
+    let stderr = err.join().unwrap();
+    assert!(stdout.len() <= 131072 && stderr.len() <= 131072);
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    String::from_utf8(stdout).unwrap()
+}
+
+#[test]
+fn large_output_child() {
+    print!("{}", "x".repeat(32768));
+}
+
+#[test]
+fn replies_larger_than_a_pipe_buffer_are_drained_before_waiting() {
+    let output = answer(
+        &std::env::current_exe().unwrap(),
+        &["--exact", "large_output_child", "--nocapture"],
+        Path::new("/"),
     );
-    String::from_utf8(output.stdout).unwrap()
+    assert!(output.contains(&"x".repeat(32768)));
 }
 
 #[test]

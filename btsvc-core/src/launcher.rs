@@ -4,17 +4,17 @@
 //! advances only after the caller records an actual launch. The caller
 //! supplies input state, timestamps and output storage.
 
-/// Poll cadence the shell drives [`Launcher::poll`] at (`GUIDE_POLL_MS`).
+/// Poll cadence the caller drives [`Launcher::poll`] at (`GUIDE_POLL_MS`).
 pub const GUIDE_POLL_MS: u32 = 250;
-/// Default hold time (`BTGP_GUIDE_HOLD_MS` unset).
+/// Default hold interval in milliseconds.
 pub const DEFAULT_HOLD_MS: u32 = 1000;
 /// Debounce interval for all launch triggers.
 pub const DEBOUNCE_MS: u32 = 2000;
-/// Pad slots - matches `BTGP_MAX_PADS` / the shm array.
+/// Maximum number of concurrent controller slots.
 pub const PAD_SLOTS: usize = crate::sm::MAX_PADS;
 /// Maximum keyboard and mouse slots.
 pub const KBM_SLOTS: usize = 3;
-/// The guide/PS/Xbox button in the shm `buttons` word (bit 12, `BTN_PS`).
+/// The Guide/PS/Xbox bit in [`crate::report::PadState::buttons`].
 pub const GUIDE_BUTTON: u32 = 1 << crate::report::BTN_PS;
 
 /// A launch trigger that crossed its hold threshold this poll.
@@ -26,7 +26,7 @@ pub enum Trigger {
     KeyboardHome { slot: usize },
 }
 
-/// The launcher state machine. All times are shell-provided milliseconds from
+/// The launcher state machine. All times are caller-provided milliseconds from
 /// one monotonic clock.
 pub struct Launcher {
     hold_ms: u32,
@@ -59,7 +59,7 @@ impl Launcher {
     /// The keyboard side compares now_ms against
     /// the hold start. Returns the number of triggers written to `out` -
     /// every pad crossing plus at most one keyboard crossing. Emit regardless
-    /// of the debounce (the fired latch must be set either way); the shell
+    /// of the debounce (the fired latch must be set either way). The caller
     /// gates the actual spawn on [`debounce_ok`](Self::debounce_ok) and its
     /// child check.
     pub fn poll(
@@ -104,7 +104,7 @@ impl Launcher {
     /// any page-7 / page-0x0C field; `home7_down` = a PRESSED page-7 0x4A was
     /// in it; `ac_home_down` = the consumer 0x223 field's value was non-zero.
     /// Each usage's release is tracked only from reports that carry its page.
-    // Keep the established shell API: flags describe independent HID pages.
+    // The flags describe independent HID pages.
     #[allow(clippy::fn_params_excessive_bools)]
     pub fn kbm_report(
         &mut self,
@@ -154,8 +154,7 @@ impl Launcher {
         }
     }
 
-    /// Record an actual spawn. Only a real spawn advances the debounce - the
-    /// C sets `last_launch_ms` after the child-still-running check.
+    /// Record an actual process start. An already running child does not advance the debounce.
     pub fn note_launch(&mut self, now_ms: u32) {
         self.last_launch = Some(now_ms);
     }
@@ -206,7 +205,7 @@ mod tests {
     #[test]
     fn hold_fires_once_at_threshold_and_latches() {
         let mut l = Launcher::new(DEFAULT_HOLD_MS);
-        // 4th tick accumulates 1000 ms -> fire; 20 more held ticks stay silent
+        // 4th tick accumulates 1000 ms -> fire. 20 more held ticks stay silent
         let fired = drive(&mut l, 0, 24, pad(0));
         assert_eq!(fired, vec![(4 * T, Trigger::GuideHeld { slot: 0 })]);
     }
@@ -220,7 +219,7 @@ mod tests {
         // hold again: fires on the 4th tick of the new hold
         let fired = drive(&mut l, 1250, 4, pad(0));
         assert_eq!(fired, vec![(1250 + 4 * T, Trigger::GuideHeld { slot: 0 })]);
-        // ...and the shell-side debounce would still block a spawn this soon:
+        // ...and the caller-side debounce would still block a spawn this soon:
         assert!(!l.debounce_ok(1250 + 4 * T));
         assert!(l.debounce_ok(4 * T + DEBOUNCE_MS));
     }
@@ -236,7 +235,7 @@ mod tests {
 
     #[test]
     fn blocked_launch_does_not_consume_debounce() {
-        // The shell skips note_launch when the child is still running - the
+        // The caller skips note_launch when the child is still running - the
         // debounce must not advance from the trigger alone.
         let mut l = Launcher::new(DEFAULT_HOLD_MS);
         let mut buf = [Trigger::GuideHeld { slot: 0 }; 8];
@@ -276,7 +275,7 @@ mod tests {
             d
         };
         assert_eq!(drive(&mut l, 0, 3, both), vec![]); // both at 750 ms
-                                                       // release pad 0 only; pad 1 fires on its 4th tick
+                                                       // Release pad zero only. Pad one fires on its fourth tick.
         let fired = drive(&mut l, 750, 1, pad(1));
         assert_eq!(fired, vec![(1000, Trigger::GuideHeld { slot: 1 })]);
     }
@@ -299,7 +298,7 @@ mod tests {
         assert_eq!(l.poll(1100, T, &NONE, &mut buf), 1); // 1000 ms held
         assert_eq!(buf[0], Trigger::KeyboardHome { slot: 0 });
         assert_eq!(l.poll(1350, T, &NONE, &mut buf), 0); // latched
-                                                         // release resets; a new hold fires again
+                                                         // Release resets the latch. A new hold fires again.
         l.kbm_report(0, true, false, false, false, 1400);
         l.kbm_report(0, true, true, false, false, 1500);
         assert_eq!(l.poll(2500, T, &NONE, &mut buf), 1);
@@ -358,7 +357,7 @@ mod tests {
 
     #[test]
     fn pad_and_keyboard_same_poll_both_emitted() {
-        // The shell's debounce collapses them to one spawn, but the core
+        // The caller's debounce collapses them to one spawn, but the core
         // reports both crossings (each latches its own fired flag).
         let mut l = Launcher::new(DEFAULT_HOLD_MS);
         let mut buf = [Trigger::GuideHeld { slot: 0 }; 8];

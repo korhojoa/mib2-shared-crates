@@ -11,12 +11,12 @@ use crate::report::{
 /// A 48-bit Bluetooth address (display order).
 pub type BdAddr = [u8; 6];
 
-/// Concurrent pad slots - matches `BTGP_MAX_PADS` / the shm array (v5 "BTG5").
+/// Maximum concurrent controller slots.
 ///
-/// 8 is the ABI ceiling, not a radio promise: a Bluetooth Classic piconet
+/// The slot capacity is eight. A Bluetooth Classic piconet
 /// addresses at most SEVEN active slaves (3-bit `LT_ADDR`, 0 reserved for the
 /// master's broadcast), and that budget is shared with any Classic kbd/mouse
-/// this daemon holds. BLE connections are a separate pool, so 8 concurrent
+/// the caller holds. BLE connections use a separate pool, so eight concurrent
 /// pads is reachable only as a Classic + BLE mix (e.g. 6 + 2).
 pub const MAX_PADS: usize = 8;
 
@@ -27,14 +27,14 @@ pub const LE_MAX_BONDS: usize = MAX_PADS;
 /// What the LE side should do when idle. The host-like reconnect model:
 /// bonded devices ride the controller accept-list (one outstanding
 /// connect-with-whitelist covers ALL of them - the controller completes it
-/// when ANY listed device wakes and advertises); scanning happens only to
+/// when ANY listed device wakes and advertises). Scanning happens only to
 /// pair a new device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeAction {
     /// Nothing to do (busy, or every bonded device is connected).
     Idle,
     /// Bonded devices are missing - put each ([`PadCore::missing_le_bonds`]
-    /// plus the shell's missing kbm bonds) on the accept-list and keep one
+    /// plus the caller's missing kbm bonds) on the accept-list and keep one
     /// connect-with-whitelist outstanding.
     WhitelistConnect,
     /// Scan for something new. `pairing` = a fresh-pairing session (100%
@@ -48,8 +48,7 @@ struct LeBond {
     atype: u8,
 }
 
-/// Bounded DS3 "set operational" nudge retries. C: `DS3_START_MAX_TRIES`. A
-/// silent Xbox must not be poked with 0xF4 forever.
+/// Maximum DS3 operational-state retries. A silent device receives no more than this many requests.
 pub const DS3_START_MAX_TRIES: u8 = 10;
 
 const SETUP_FIRST_MS: u32 = 400;
@@ -95,16 +94,16 @@ pub enum Event<'a> {
     /// A per-slot setup timer fired.
     SetupTick { slot: u8 },
 
-    // --- LE / HOGP (the shell drives scan/connect/pair/hids I/O; these events
+    // --- LE / HOGP (the caller drives scan/connect/pair/hids I/O. These events
     // carry the results so slot management + classify/publish stay unified with
     // the Classic path). ---
-    /// An LE pad ACL connection completed (the shell only sends this after its
-    /// own outgoing connect - the ghost-slot guard lives shell-side).
+    /// An LE pad ACL connection completed (the caller only sends this after its
+    /// own outgoing connect - the ghost-slot guard lives caller-side).
     LeConnected { le_handle: u16, addr: BdAddr },
     /// The HOGP client cid became known for an LE slot (after `hids_client_connect`).
     LeHidsCid { le_handle: u16, hids_cid: u16 },
     /// One HOGP report from `hids_client` (payload WITHOUT the 0xa1/report-id
-    /// header; the core frames it). Delivery here makes the raw path stand down.
+    /// header, which the core supplies). Delivery here makes the raw path stand down.
     LeReport {
         hids_cid: u16,
         report_id: u8,
@@ -125,8 +124,8 @@ pub enum Event<'a> {
 /// HID connection open status: success. `BTstack` `ERROR_CODE_SUCCESS`.
 pub const STATUS_SUCCESS: u8 = 0;
 
-/// Outputs - `BTstack` calls and shm writes the shell performs. No formatted
-/// strings: logging is the shell's job, driven off these structured commands.
+/// Outputs - `BTstack` calls and shm writes the caller performs. No formatted
+/// strings: logging is the caller's job, driven off these structured commands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Accept an incoming HID connection (report protocol mode).
@@ -226,13 +225,11 @@ impl PadSlot {
     };
 }
 
-/// The Classic pad-lifecycle core.
+/// The Classic and LE controller lifecycle state machine.
 pub struct PadCore {
     pads: [PadSlot; MAX_PADS],
     config: Config,
-    connecting: bool,
     redial: bool,
-    target: Option<BdAddr>,
     pending: Option<(u16, BdAddr)>, // deferred descriptor routing
     le_bonds: [LeBond; LE_MAX_BONDS],
     le_num_bonds: usize,
@@ -244,9 +241,7 @@ impl PadCore {
         PadCore {
             pads: [PadSlot::EMPTY; MAX_PADS],
             config,
-            connecting: false,
             redial: false,
-            target: None,
             pending: None,
             le_bonds: [LeBond {
                 addr: [0; 6],
@@ -279,7 +274,7 @@ impl PadCore {
             .any(|b| b.addr == *addr)
     }
 
-    /// The bonded address+type at a bond index (for the shell to connect it).
+    /// Return the address type for the given bonded address.
     #[must_use]
     pub fn le_bond(&self, addr: &BdAddr) -> Option<u8> {
         self.le_bonds[..self.le_num_bonds]
@@ -289,10 +284,10 @@ impl PadCore {
     }
 
     /// Decide the LE side's action when idle. `busy` = a directed LE connect
-    /// is already in flight. `kbm_bonds` / `kbm_missing` describe the shell's
+    /// is already in flight. `kbm_bonds` / `kbm_missing` describe the caller's
     /// kbm bond table (bonded count / any bonded-but-disconnected), so one
     /// decision covers both sides of the radio. Priority: a pairing session
-    /// scans; any missing bond arms the accept-list; a box with no bonds at
+    /// scans. Any missing bond arms the accept-list. A device with no bonds at
     /// all bootstraps with a pairing scan (the OUI gate still applies).
     #[must_use]
     pub fn le_decide(
@@ -337,10 +332,7 @@ impl PadCore {
     }
 
     /// True once this connection has been classified as a known pad family.
-    /// The shell uses it to hex-dump reports from pads we do NOT recognise
-    /// (`BTGP_PADPROBE`) - `classify()` covers only DS4/DS3/Xbox and everything
-    /// else is dropped silently, which leaves a new model with no trace to
-    /// write a parser from.
+    /// The caller can use this result to record reports from unrecognized controllers.
     #[must_use]
     pub fn cid_is_classified(&self, cid: u16) -> bool {
         self.pads
@@ -393,11 +385,9 @@ impl PadCore {
     /// Panics if an internal slot index exceeds the fixed pad table.
     pub fn on_event(&mut self, ev: Event, out: &mut impl Emit) {
         match ev {
-            Event::HidIncoming { cid, addr } => {
-                // Accept everything; sort keyboard/mouse/pad at OPENED. Arm a
+            Event::HidIncoming { cid, .. } => {
+                // Accept everything. Sort keyboard/mouse/pad at OPENED. Arm a
                 // single dial-back in case the incoming handshake times out.
-                self.connecting = true;
-                self.target = Some(addr);
                 self.redial = true;
                 out.emit(Command::HidAccept { cid });
             }
@@ -416,7 +406,7 @@ impl PadCore {
             Event::HidReport { cid, data } => self.on_report(cid, data, out),
             Event::HidClosed { cid } => self.on_closed(cid, out),
             Event::SetupTick { slot } => self.on_setup_tick(slot, out),
-            Event::LeConnected { le_handle, addr } => self.on_le_connected(le_handle, addr),
+            Event::LeConnected { le_handle, addr } => self.on_le_connected(le_handle, addr, out),
             Event::LeHidsCid {
                 le_handle,
                 hids_cid,
@@ -435,7 +425,7 @@ impl PadCore {
         }
     }
 
-    /// The HOGP client cid for an LE connection handle (for the shell's raw
+    /// The HOGP client cid for an LE connection handle (for the caller's raw
     /// notification path). None if the handle isn't a known LE pad slot.
     #[must_use]
     pub fn le_hids_cid_for_handle(&self, le_handle: u16) -> Option<u16> {
@@ -443,7 +433,7 @@ impl PadCore {
             .map(|s| self.pads[s].hids_cid)
     }
 
-    /// Is this address already occupying an LE slot? (Guards the shell against
+    /// Is this address already occupying an LE slot? (Guards the caller against
     /// reconnecting a pad that is already connected but still advertising.)
     #[must_use]
     pub fn le_addr_connected(&self, addr: &BdAddr) -> bool {
@@ -464,21 +454,27 @@ impl PadCore {
             .position(|p| p.used && p.is_le && p.hids_cid == c)
     }
 
-    fn on_le_connected(&mut self, le_handle: u16, addr: BdAddr) {
-        // The shell already applied the ghost-slot guard (only connects it
-        // initiated). Reserve a slot; classification waits for the first
+    fn on_le_connected(&mut self, le_handle: u16, addr: BdAddr, out: &mut impl Emit) {
+        // The caller already applied the ghost-slot guard (only connects it
+        // initiated). Reserve a slot. Classification waits for the first
         // report. LE pads need no setup-tick nudge (that is Classic DS3/DS4).
         if self.slot_by_le_handle(le_handle).is_some() {
             return;
         }
-        if let Some(slot) = self.alloc() {
-            self.pads[slot] = PadSlot {
-                used: true,
-                is_le: true,
-                le_handle,
-                addr,
-                ..PadSlot::EMPTY
-            };
+        let Some(slot) = self.alloc() else {
+            out.emit(Command::GapDisconnectAcl { addr });
+            out.emit(Command::LeSuspend);
+            return;
+        };
+        self.pads[slot] = PadSlot {
+            used: true,
+            is_le: true,
+            le_handle,
+            addr,
+            ..PadSlot::EMPTY
+        };
+        if self.pads_full() {
+            out.emit(Command::LeSuspend);
         }
     }
 
@@ -507,8 +503,7 @@ impl PadCore {
         } else {
             self.pads[slot].hids_delivers = true;
         }
-        // Frame as the parsers expect: 0xa1, report_id, payload. C:
-        // le_publish_report.
+        // The parser input contains 0xa1, the report ID and the payload.
         let mut buf = [0u8; 66];
         let n = data.len().min(buf.len() - 2);
         buf[0] = 0xa1;
@@ -535,18 +530,15 @@ impl PadCore {
         descriptor: &[u8],
         out: &mut impl Emit,
     ) {
-        self.connecting = false;
         if status != STATUS_SUCCESS {
             if self.redial {
                 self.redial = false; // one dial-back per attempt
-                self.target = Some(addr);
                 out.emit(Command::HidConnect { addr });
                 return;
             }
             // Give up - never leave a half-open ACL (the pad thinks it is
             // connected, solid light, and won't re-page). Drop it by address.
             out.emit(Command::GapDisconnectAcl { addr });
-            self.target = None;
             return;
         }
         self.redial = false;
@@ -568,9 +560,8 @@ impl PadCore {
         } else {
             app_usages(descriptor)
         };
-        // kbm path: a keyboard/mouse that is not also a pad. (The C also
-        // reroutes a descriptor-less reconnect of a remembered kbm address;
-        // that address memory belongs to the kbm module, added with it.)
+        // Descriptor classification routes a keyboard or mouse that is not also a pad.
+        // The caller supplies remembered device identity for descriptor-less reconnections.
         if self.config.kbm_enabled && (app.kbd || app.mouse) && !app.pad {
             out.emit(Command::RouteKbm {
                 cid,
@@ -581,12 +572,19 @@ impl PadCore {
             return;
         }
         if !final_ && descriptor.is_empty() {
+            if self.pending.is_some_and(|(pending, _)| pending != cid) {
+                out.emit(Command::HidDisconnect { cid });
+                return;
+            }
             self.pending = Some((cid, addr));
             return;
         }
         // pad path
         match self.alloc() {
-            None => out.emit(Command::HidDisconnect { cid }),
+            None => {
+                out.emit(Command::HidDisconnect { cid });
+                out.emit(Command::GapDisconnectAcl { addr });
+            }
             Some(slot) => {
                 self.pads[slot] = PadSlot {
                     used: true,
@@ -614,7 +612,7 @@ impl PadCore {
         if p.pad_type.is_none() {
             // Silent link -> almost certainly a DS3 waiting for the 0xF4 nudge.
             // Alternate enable / LED across ticks (one SET_REPORT handshake per
-            // round-trip; a second in the same tick is refused 0x0c). Bounded.
+            // round-trip. A second in the same tick is refused 0x0c). Bounded.
             if p.ds3_start_tries < DS3_START_MAX_TRIES {
                 p.ds3_start_tries += 1;
                 if p.ds3_start_tries & 1 == 1 {
@@ -636,7 +634,7 @@ impl PadCore {
                 ms: SETUP_DS4_FULL_MS,
             });
         }
-        // Classified DS3/Xbox: nothing left; the timer stops (no re-arm).
+        // Classified DS3/Xbox: nothing left. The timer stops (no re-arm).
     }
 
     fn on_report(&mut self, cid: u16, data: &[u8], out: &mut impl Emit) {
@@ -672,7 +670,7 @@ impl PadCore {
                         slot: u8::try_from(slot).expect("bounded pad slot"),
                         pad_type: t,
                     });
-                    // Classic-only side effects (SDP DeviceID query; DS3 LED).
+                    // Classic-only side effects (SDP DeviceID query and DS3 LED).
                     if !is_le {
                         out.emit(Command::DidQuery {
                             addr: self.pads[slot].addr,
@@ -735,8 +733,6 @@ impl PadCore {
                 slot: u8::try_from(slot).expect("bounded pad slot"),
             });
             self.pads[slot] = PadSlot::EMPTY;
-            self.connecting = false;
-            self.target = None;
             out.emit(Command::LeReArm);
         }
     }
@@ -776,6 +772,29 @@ mod tests {
                 descriptor: &[],
             },
         )
+    }
+
+    #[test]
+    fn incoming_failure_redials_once_then_releases_the_acl() {
+        let mut core = PadCore::new(Config::default());
+        let addr = [1, 2, 3, 4, 5, 6];
+        let incoming = drive(&mut core, Event::HidIncoming { cid: 7, addr });
+        assert!(matches!(
+            incoming.as_slice(),
+            [Command::HidAccept { cid: 7 }]
+        ));
+        let failure = || Event::HidOpened {
+            cid: 7,
+            addr,
+            status: 1,
+            descriptor: &[],
+        };
+        assert!(
+            matches!(drive(&mut core, failure()).as_slice(), [Command::HidConnect { addr: a }] if *a == addr)
+        );
+        assert!(
+            matches!(drive(&mut core, failure()).as_slice(), [Command::GapDisconnectAcl { addr: a }] if *a == addr)
+        );
     }
 
     #[test]
@@ -949,11 +968,16 @@ mod tests {
             );
         }
         assert_eq!(core.pad_count(), MAX_PADS);
-        // one more -> HidDisconnect, no slot
-        let cmds = open_a_pad(&mut core, 0x99, [9, 9, 9, 9, 9, 9]);
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::HidDisconnect { cid: 0x99 })));
+        let addr = [9, 9, 9, 9, 9, 9];
+        let cmds = open_a_pad(&mut core, 0x99, addr);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::HidDisconnect { cid: 0x99 },
+                Command::GapDisconnectAcl { addr }
+            ]
+        );
+        assert_eq!(core.pad_count(), MAX_PADS);
     }
 
     #[test]
@@ -986,7 +1010,7 @@ mod tests {
     #[test]
     fn le_connect_report_classifies_xbox_and_publishes() {
         let mut core = PadCore::new(Config::default());
-        // shell-driven LE lifecycle
+        // caller-driven LE lifecycle
         let c = drive(
             &mut core,
             Event::LeConnected {
@@ -1178,7 +1202,7 @@ mod tests {
     #[test]
     fn le_missing_bonds_empty_when_pads_full() {
         // A full pad table has no slot to land a reconnect in - the pad half
-        // of the accept-list must go empty (kbm reconnect stays the shell's).
+        // of the accept-list must go empty (kbm reconnect stays the caller's).
         let mut core = PadCore::new(Config::default());
         let bonded = [7, 7, 7, 7, 7, 7];
         core.add_le_bond(bonded, 0);
@@ -1358,5 +1382,88 @@ mod tests {
             core.rumble_route(0),
             Some((PadType::Xbox, RumbleRoute::Le { hids_cid: 0x0111 }))
         );
+    }
+    #[test]
+    fn full_pad_table_refuses_an_extra_le_connection() {
+        let mut core = PadCore::new(Config::default());
+        for i in 0..MAX_PADS {
+            let commands = drive(
+                &mut core,
+                Event::LeConnected {
+                    le_handle: u16::try_from(i + 1).unwrap(),
+                    addr: [u8::try_from(i + 1).unwrap(); 6],
+                },
+            );
+            let _ = commands;
+        }
+        let addr = [42; 6];
+        let commands = drive(
+            &mut core,
+            Event::LeConnected {
+                le_handle: 42,
+                addr,
+            },
+        );
+        assert!(commands.contains(&Command::GapDisconnectAcl { addr }));
+        assert!(commands.contains(&Command::LeSuspend));
+        assert_eq!(core.pads.iter().filter(|pad| pad.used).count(), MAX_PADS);
+    }
+
+    #[test]
+    fn second_deferred_connection_does_not_replace_the_first() {
+        let mut core = PadCore::new(Config::default());
+        for cid in [1, 2] {
+            let commands = drive(
+                &mut core,
+                Event::HidOpened {
+                    cid,
+                    addr: [u8::try_from(cid).unwrap(); 6],
+                    status: STATUS_SUCCESS,
+                    descriptor: &[],
+                },
+            );
+            if cid == 2 {
+                assert!(commands.contains(&Command::HidDisconnect { cid }));
+            }
+        }
+        let routed = drive(
+            &mut core,
+            Event::HidDescriptorAvailable {
+                cid: 1,
+                descriptor: &[],
+            },
+        );
+        assert!(routed.iter().any(|c| matches!(c, Command::SetTimer { .. })));
+        let input = drive(
+            &mut core,
+            Event::HidReport {
+                cid: 1,
+                data: &ds4_simple_neutral(),
+            },
+        );
+        assert!(input
+            .iter()
+            .any(|c| matches!(c, Command::ShmPublish { .. })));
+    }
+    #[test]
+    fn the_last_le_slot_suspends_further_connections() {
+        let mut core = PadCore::new(Config::default());
+        for i in 0..MAX_PADS - 1 {
+            drive(
+                &mut core,
+                Event::LeConnected {
+                    le_handle: u16::try_from(i + 1).unwrap(),
+                    addr: [u8::try_from(i + 1).unwrap(); 6],
+                },
+            );
+        }
+        let commands = drive(
+            &mut core,
+            Event::LeConnected {
+                le_handle: 99,
+                addr: [99; 6],
+            },
+        );
+        assert_eq!(commands, [Command::LeSuspend]);
     }
 }

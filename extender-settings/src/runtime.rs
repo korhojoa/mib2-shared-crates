@@ -3,16 +3,54 @@ use crate::{config::Snapshot, schema, store, wall_ms, ABI};
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CStr};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 struct Session {
+    startup: Snapshot,
+    refused: BTreeMap<String, (String, i32)>,
     active: Snapshot,
     live: Snapshot,
     loaded: BTreeMap<String, i32>,
     error: String,
 }
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+
+/// Apply one value on the settings reader thread. The callback must not call
+/// the settings reader. Return false when the consumer cannot apply it.
+pub type LiveApply = fn(&str, i32) -> bool;
+static LIVE_APPLY: OnceLock<LiveApply> = OnceLock::new();
+
+/// Install the loaded component's live consumer after feature initialization.
+/// The existing reader loop is the only settings refresh worker.
+pub fn install_live_apply(apply: LiveApply) -> bool {
+    LIVE_APPLY.set(apply).is_ok()
+}
+
+fn capable(session: &Session, key: &str) -> bool {
+    crate::live::eligible(&session.startup, key)
+        && crate::live::module(key).is_none_or(|module| session.loaded.get(module) == Some(&1))
+}
+
+fn refresh(session: &mut Session, next: Snapshot, apply: LiveApply) {
+    let token = next.token();
+    for setting in schema::SETTINGS {
+        let key = setting.key;
+        let value = next.get(key, setting.default);
+        if capable(session, key) && session.active.get(key, setting.default) != value {
+            if session.refused.get(key) == Some(&(token.clone(), value)) {
+                continue;
+            }
+            if apply(key, value) {
+                session.active.values.insert(key.into(), value);
+                session.refused.remove(key);
+            } else {
+                session.refused.insert(key.into(), (token.clone(), value));
+            }
+        }
+    }
+    session.live = next;
+}
 
 unsafe fn string<'a>(p: *const c_char) -> Option<&'a str> {
     if p.is_null() {
@@ -43,12 +81,18 @@ impl StatusWriter {
     }
 }
 
+/// Return the settings ABI version. This function has no initialization requirement.
 #[no_mangle]
 pub extern "C" fn extender_settings_abi() -> u32 {
     ABI
 }
 
 /// Initialize pinned settings. A null status path disables the optional publisher.
+/// Return zero on success and -1 on invalid input or initialization failure.
+///
+/// # Safety
+/// Non-null arguments must point to valid NUL-terminated UTF-8 strings during this call.
+/// `base` and `dir` must be non-null. `status` must name a PPS object when supplied.
 #[no_mangle]
 pub unsafe extern "C" fn extender_settings_init(
     base: *const c_char,
@@ -84,6 +128,8 @@ pub unsafe extern "C" fn extender_settings_init(
         return -1;
     }
     *guard = Some(Session {
+        startup: active.clone(),
+        refused: BTreeMap::new(),
         live: active.clone(),
         active,
         loaded: BTreeMap::new(),
@@ -112,10 +158,16 @@ pub unsafe extern "C" fn extender_settings_init(
                 let Some(s) = guard.as_mut() else {
                     return;
                 };
-                // Refresh acknowledgments without changing the settings pinned
-                // until a new gal process starts.
-                if let Ok(next) = fresh {
-                    s.live = next;
+                match fresh {
+                    Ok(next) => {
+                        s.error.clear();
+                        if let Some(apply) = LIVE_APPLY.get() {
+                            refresh(s, next, *apply);
+                        } else {
+                            s.live = next;
+                        }
+                    }
+                    Err(error) => s.error = error,
                 }
                 let applied_token = if dir == active_dir && s.active.same_startup_settings(&s.live)
                 {
@@ -123,17 +175,19 @@ pub unsafe extern "C" fn extender_settings_init(
                 } else {
                     format!("pending-{}", s.active.token())
                 };
-                let mut text = format!(
-                    "version=1\npid={}\nupdated_ms={}\ntoken={}\ndir={}\nbase={}\nerror={}\n",
-                    std::process::id(),
-                    wall_ms(),
-                    applied_token,
-                    dir.display(),
-                    base.display(),
-                    clean(&s.error)
-                );
+                let mut text = status_header(&applied_token, &dir, &base, &s.error);
                 for (name, state) in &s.loaded {
                     text.push_str(&format!("loaded.{name}={state}\n"));
+                }
+                for setting in schema::SETTINGS {
+                    if LIVE_APPLY.get().is_some() && capable(s, setting.key) {
+                        text.push_str(&format!("live.{}=1\n", setting.key));
+                        text.push_str(&format!(
+                            "applied.{}={}\n",
+                            setting.key,
+                            s.active.get(setting.key, setting.default)
+                        ));
+                    }
                 }
                 text.push_str("end=1\n");
                 text
@@ -150,12 +204,28 @@ pub unsafe extern "C" fn extender_settings_init(
     0
 }
 
+fn status_header(token: &str, dir: &Path, base: &Path, error: &str) -> String {
+    format!(
+        "version=1\npid={}\nupdated_ms={}\ntoken={}\ndir={}\nbase={}\nerror={}\n",
+        std::process::id(),
+        wall_ms(),
+        token,
+        clean(&dir.to_string_lossy()),
+        clean(&base.to_string_lossy()),
+        clean(error)
+    )
+}
+
 pub fn clean(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
 
+/// Read a pinned integer, or return the supplied default when unavailable.
+///
+/// # Safety
+/// A non-null string argument must remain valid and NUL-terminated during this call.
 #[no_mangle]
 pub unsafe extern "C" fn extender_settings_get_int(key: *const c_char, default: i32) -> i32 {
     let Some(key) = string(key) else {
@@ -170,6 +240,10 @@ pub unsafe extern "C" fn extender_settings_get_int(key: *const c_char, default: 
     s.active.get(key, default)
 }
 
+/// Return one when the named feature is enabled, otherwise zero.
+///
+/// # Safety
+/// A non-null string argument must remain valid and NUL-terminated during this call.
 #[no_mangle]
 pub unsafe extern "C" fn extender_settings_feature(name: *const c_char) -> i32 {
     let Some(name) = string(name) else {
@@ -183,6 +257,10 @@ pub unsafe extern "C" fn extender_settings_feature(name: *const c_char) -> i32 {
         .map_or(0, |s| i32::from(s.active.feature(name)))
 }
 
+/// Record the load state of a supported feature for the optional status publisher.
+///
+/// # Safety
+/// A non-null string argument must remain valid and NUL-terminated during this call.
 #[no_mangle]
 pub unsafe extern "C" fn extender_settings_loaded(name: *const c_char, state: i32) {
     let Some(name) = string(name) else {
@@ -224,6 +302,9 @@ pub fn application_status(snapshot: &Snapshot, dir: &Path, status: &Path) -> Str
         return format!("AA settings error: {error}");
     }
     if fields.get("token").copied() != Some(snapshot.token().as_str()) {
+        if fields.keys().any(|key| key.starts_with("live.")) {
+            return "Saved; live controls update now, other settings next AA start".into();
+        }
         return "Saved; applies on next AA start".into();
     }
     for name in schema::FEATURES {
@@ -274,6 +355,98 @@ pub fn render(snapshot: &Snapshot, dir: &Path, status: &Path) -> String {
     text
 }
 
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let startup = Snapshot {
+            base: "cluster\nsensor\nsensor_ev_advertise=1\nsensor_send_compass=1\n".into(),
+            values: BTreeMap::new(),
+            revision: 0,
+        };
+        Session {
+            refused: BTreeMap::new(),
+            startup: startup.clone(),
+            active: startup.clone(),
+            live: startup,
+            loaded: BTreeMap::from([("cluster".into(), 1), ("sensor".into(), 1)]),
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_accepted_runtime_values_change_and_geometry_stays_pinned() {
+        let mut session = session();
+        let next = session
+            .active
+            .changed(&[
+                ("cluster_write_pace_pct".into(), "75".into()),
+                ("main_dpi".into(), "160".into()),
+                ("sensor_ev_capacity_wh".into(), "42000".into()),
+            ])
+            .unwrap();
+        refresh(&mut session, next, |key, _| key != "sensor_ev_capacity_wh");
+        assert_eq!(session.active.get("cluster_write_pace_pct", 100), 75);
+        assert_eq!(session.active.get("main_dpi", 0), 0);
+        assert_eq!(session.active.get("sensor_ev_capacity_wh", 30000), 30000);
+        assert_eq!(session.live.get("main_dpi", 0), 160);
+    }
+
+    #[test]
+    fn an_offered_sensor_can_stop_and_resume_but_an_unoffered_one_waits() {
+        let mut session = session();
+        let next = session
+            .live
+            .changed(&[
+                ("sensor_send_compass".into(), "0".into()),
+                ("sensor_send_rpm".into(), "1".into()),
+            ])
+            .unwrap();
+        refresh(&mut session, next, |_, _| true);
+        assert_eq!(session.active.get("sensor_send_compass", 1), 0);
+        assert_eq!(session.active.get("sensor_send_rpm", 0), 0);
+        let next = session
+            .live
+            .changed(&[("sensor_send_compass".into(), "1".into())])
+            .unwrap();
+        refresh(&mut session, next, |_, _| true);
+        assert_eq!(session.active.get("sensor_send_compass", 0), 1);
+    }
+
+    #[test]
+    fn missing_modules_do_not_acknowledge_and_repeated_snapshots_do_not_apply_twice() {
+        let mut session = session();
+        session.loaded.insert("cluster".into(), 0);
+        let next = session
+            .live
+            .changed(&[("cluster_write_pace_pct".into(), "75".into())])
+            .unwrap();
+        refresh(&mut session, next.clone(), |_, _| panic!("unloaded module"));
+        session.loaded.insert("cluster".into(), 1);
+        refresh(&mut session, next.clone(), |_, _| true);
+        refresh(&mut session, next, |_, _| panic!("unchanged value"));
+    }
+
+    #[test]
+    fn refused_generation_is_not_retried_until_the_saved_generation_changes() {
+        let mut session = session();
+        let next = session
+            .live
+            .changed(&[("cluster_write_pace_pct".into(), "75".into())])
+            .unwrap();
+        refresh(&mut session, next.clone(), |_, _| false);
+        refresh(&mut session, next, |_, _| panic!("same refused generation"));
+        assert_eq!(session.active.get("cluster_write_pace_pct", 100), 100);
+        let next = session
+            .live
+            .changed(&[("cluster_write_pace_pct".into(), "80".into())])
+            .unwrap();
+        refresh(&mut session, next, |_, _| true);
+        assert_eq!(session.active.get("cluster_write_pace_pct", 100), 80);
+    }
+}
+
 pub fn snapshot_text(snapshot: &Snapshot, dir: &Path) -> String {
     render(
         snapshot,
@@ -296,6 +469,10 @@ mod tests {
         assert!(!status.starts_with("Applied"));
         let output = render(&s, Path::new("/missing"), Path::new("/missing/no-status"));
         assert!(output.ends_with("end\t1\n"));
+        for row in output.lines().filter(|line| line.starts_with("row\t")) {
+            let fields: Vec<_> = row.split('\t').collect();
+            assert_eq!(fields[3], schema::find(fields[1]).unwrap().label);
+        }
         assert!(output.contains("row\tfeature.cluster\tDisplays\tCluster map\tbool\t1\t"));
     }
 
@@ -391,5 +568,20 @@ mod null_status_contract {
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         *SESSION.lock().unwrap() = None;
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn status_paths_cannot_add_pps_fields() {
+        let text = status_header(
+            "token",
+            Path::new("dir\nend=1"),
+            Path::new("base\r\nloaded.sensor=1"),
+            "error\ntext",
+        );
+        assert_eq!(text.lines().count(), 7);
+        assert!(!text
+            .lines()
+            .any(|line| line == "end=1" || line == "loaded.sensor=1"));
+        let valid = status_header("token", Path::new("settings"), Path::new("loader.conf"), "");
+        assert!(valid.contains("\ndir=settings\nbase=loader.conf\nerror=\n"));
     }
 }

@@ -19,7 +19,7 @@ fn run() -> Result<String, String> {
         "snapshot" if args.len() == 2 => match carplay::load_present(path)? {
             Some(snapshot) => snapshot,
             None => {
-                let name = carplay::absent_text(&args[0], path);
+                let name = carplay::absent_text(path);
                 return Ok(carplay::absent_protocol(&name));
             }
         },

@@ -4,7 +4,7 @@
 //! Reject unsupported identifiers and short input.
 
 /// Axis count. Order: 0 LX, 1 LY, 2 RX, 3 RY, 4 L2, 5 R2.
-/// Range -32768..32767; triggers use 0..32767 span mapped the same way.
+/// Stick and trigger range: -32768..32767. A released trigger is -32768.
 pub const NAXES: usize = 6;
 /// Button count (bits 0..17 of [`PadState::buttons`]).
 pub const NBUTTONS: usize = 18;
@@ -29,7 +29,7 @@ pub const BTN_DPAD_DOWN: u32 = 15;
 pub const BTN_DPAD_LEFT: u32 = 16;
 pub const BTN_DPAD_RIGHT: u32 = 17;
 
-/// Controller family (identity only; the normalized state is uniform).
+/// Controller family. All families use the same normalized state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PadType {
     Ds4,
@@ -37,7 +37,7 @@ pub enum PadType {
     Xbox,
 }
 
-/// Xbox button-layout selector (`BTGP_XBOX_LAYOUT`): Auto and New both use the
+/// Xbox button-layout selector. Auto and New both use the
 /// Series-style codes. Old uses the earlier firmware layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XboxLayout {
@@ -53,7 +53,10 @@ impl XboxLayout {
     }
 }
 
-/// DS4 full-report (0x11) motion + touch. Raw DS4 units; the SDL side scales.
+/// Raw motion data and touch contacts. The controller type identifies the units.
+/// DS4 reports supply signed motion words. DS3 reports supply 10-bit words
+/// minus 512, in wire axis order. Only the DS3 yaw gyro is available.
+/// DS3 values are not calibrated and must not use the DS4 scale factors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Sensors {
     pub gyro: [i16; 3],  // pitch, yaw, roll
@@ -78,8 +81,7 @@ pub struct Battery {
 }
 
 /// Normalized controller state - the pure-data result of parsing one report.
-/// Mirrors `btgp_pad_t` content but as a value type (the `#[repr(C)]` shm
-/// mirror + seqlock writer live in the `btsvc-shm` crate).
+/// Normalized controller report. This value type does not define a shared-memory wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PadState {
     pub pad_type: PadType,
@@ -111,7 +113,7 @@ impl PadState {
     }
 }
 
-/// Stick byte (0..255, center 0x80) -> Sint16. C: `(int16_t)(v*257 - 32768)`.
+/// Map a stick byte (0..255, center 0x80) to the full i16 range.
 #[inline]
 fn low_i16(value: i64) -> i16 {
     let bytes = value.to_le_bytes();
@@ -140,7 +142,7 @@ fn hat_bits(hat: u8) -> u32 {
 }
 
 /// Xbox uses a 1-based hat (0 none, 1=N .. 8=NW), a different indexing from the
-/// DS4 low-nibble hat. C `hatbits[9]` table.
+/// DS4 low-nibble hat. Values outside 1 through 8 mean no direction.
 #[inline]
 fn xbox_hat_bits(hat: u8) -> u32 {
     match hat {
@@ -156,7 +158,7 @@ fn xbox_hat_bits(hat: u8) -> u32 {
     }
 }
 
-/// DS4 simple (0x01) or full (0x11) report. Port of `publish_ds4`.
+/// Parse a DS4 simple (0x01) or full (0x11) report.
 #[must_use]
 pub fn parse_ds4(r: &[u8]) -> Option<PadState> {
     if r.len() < 4 {
@@ -167,7 +169,7 @@ pub fn parse_ds4(r: &[u8]) -> Option<PadState> {
         0x11 => (4usize, true),
         _ => return None,
     };
-    // C: body_len = len - boff; require >= 7 (sticks + 3 button bytes).
+    // The body needs at least seven bytes for sticks and three button bytes.
     if r.len() < boff + 7 {
         return None;
     }
@@ -267,11 +269,11 @@ pub fn parse_ds4(r: &[u8]) -> Option<PadState> {
     Some(st)
 }
 
-/// DS3 / Sixaxis report (0x01, USB-style 49-byte layout over BT). Port of
-/// `publish_ds3`. `d = r+1` aligns to the documented USB report bytes.
+/// Parse a DS3/Sixaxis report (0x01, USB-style 49-byte layout over Bluetooth).
+/// The payload starts one byte after the report header.
 #[must_use]
 pub fn parse_ds3(r: &[u8]) -> Option<PadState> {
-    if r.len() < 11 {
+    if r.len() < 11 || r[..2] != [0xa1, 0x01] {
         return None;
     }
     let d = &r[1..];
@@ -344,6 +346,20 @@ pub fn parse_ds3(r: &[u8]) -> Option<PadState> {
     }
     st.buttons = b;
 
+    // The 49-byte report includes four big-endian words at offsets 41..48.
+    // The HID transaction byte precedes the report. A short report has no motion data.
+    if d.len() >= 49 {
+        let words = [41, 43, 45, 47].map(|offset| u16::from_be_bytes([d[offset], d[offset + 1]]));
+        if words.iter().all(|&word| word <= 1023) {
+            let motion = words.map(|word| i16::try_from(word).expect("10-bit motion word") - 512);
+            st.sensors = Some(Sensors {
+                accel: [motion[0], motion[1], motion[2]],
+                gyro: [0, motion[3], 0],
+                ..Sensors::default()
+            });
+        }
+    }
+
     Some(st)
 }
 
@@ -387,7 +403,7 @@ fn mapped_bits(byte: u8, table: &[(u8, u32)]) -> u32 {
         .fold(0, |acc, (_, bit)| acc | (1 << bit))
 }
 
-/// Xbox One S / Series report (0x01). Port of `publish_xbox`'s main path.
+/// Parse an Xbox One S/Series report (0x01).
 /// `guide_held` carries the old-fw guide state the state machine tracks from
 /// report 0x02 (see [`parse_xbox_guide`]); it is ignored on new-fw pads, which
 /// carry the Xbox button inline.
@@ -440,10 +456,8 @@ pub fn parse_xbox(r: &[u8], layout: XboxLayout, guide_held: bool) -> Option<PadS
     Some(st)
 }
 
-/// Classify a controller from its first input report's id + length. Port of
-/// `classify_report`'s decision (the side effects - connect, LED, DID query -
-/// belong to the state machine). Order is significant: the DS3 `len >= 40`
-/// test precedes the DS4 `len <= 13` and Xbox `len <= 20` tests.
+/// Classify a controller from the report ID and length. The state machine controls connection and output effects.
+/// The DS3 length check precedes the DS4 and Xbox length checks.
 ///
 /// `r` is the full report including the `0xa1` header. `None` = unclassified
 /// Unsupported reports do not select a controller type.
@@ -464,9 +478,8 @@ pub fn classify(r: &[u8]) -> Option<PadType> {
     }
 }
 
-/// Dispatch a report to the parser for an already-classified pad type. Port of
-/// `publish_report`'s switch. `layout`/`guide_held` are the state machine's
-/// per-pad Xbox knobs (ignored for DS4/DS3).
+/// Dispatch a report to the parser for a classified controller.
+/// `layout` and `guide_held` select Xbox behavior. DS4 and DS3 ignore these values.
 #[must_use]
 pub fn parse_for_type(
     r: &[u8],
@@ -481,9 +494,8 @@ pub fn parse_for_type(
     }
 }
 
-/// Old-fw Xbox guide-button report (id 0x02). Returns the guide-held flag the
-/// state machine keeps between input reports. C: `p->xbox_guide = (len>=3 &&
-/// (r[2]&0x01))`.
+/// Parse the guide-button flag in an Xbox report (ID 0x02, byte 2, bit 0).
+/// The state machine stores the flag between input reports.
 #[must_use]
 pub fn parse_xbox_guide(r: &[u8]) -> Option<bool> {
     if r.get(1) != Some(&0x02) {
@@ -536,7 +548,7 @@ mod tests {
 
     #[test]
     fn ds4_dpad_directions() {
-        // low nibble is the hat; keep high nibble 0 (no face)
+        // The low nibble holds the hat. The zero high nibble releases the face buttons.
         let up = parse_ds4(&ds4_simple(0x80, 0x80, 0x80, 0x80, 0x00, 0, 0)).unwrap();
         assert_eq!(up.buttons, 1 << BTN_DPAD_UP);
         let se = parse_ds4(&ds4_simple(0x80, 0x80, 0x80, 0x80, 0x03, 0, 0)).unwrap();
@@ -577,7 +589,7 @@ mod tests {
     // ---- DS4 full (0x11) ---------------------------------------------------
     #[test]
     fn ds4_full_report_analog_battery_sensors() {
-        // r = a1 11 C0 00 <body...>; body starts at index 4.
+        // The report header is a1 11 C0 00. The body starts at index 4.
         let mut r = vec![0u8; 4 + 46];
         r[0] = 0xa1;
         r[1] = 0x11;
@@ -601,7 +613,7 @@ mod tests {
         body[23] = 0xff;
         // battery body[29] = level 5, charging
         body[29] = 0x15;
-        // touch: pkt=body+33; finger0 ft=pkt+1=body[34..38]
+        // The touch packet starts at body offset 33. Finger zero starts at offset 34.
         body[34] = 0x07; // id 7, bit7 clear => down
         body[35] = 0x21; // x low
         body[36] = 0x43; // x = 0x21 | (0x3<<8)=0x321; y low nibble = 0x4
@@ -625,7 +637,7 @@ mod tests {
     // ---- DS3 ---------------------------------------------------------------
     #[test]
     fn ds3_neutral_and_buttons() {
-        // r = a1 01 <d...> with d=r+1; need len>=11. Build a 21-byte report so
+        // The payload starts after a1. The parser requires at least 11 bytes.
         // pressure path (len>=21) is exercised too.
         let mut r = vec![0u8; 21];
         r[0] = 0xa1;
@@ -658,6 +670,47 @@ mod tests {
         assert_eq!(st.axis[5], 32767);
         assert!(st.button(BTN_L2));
         assert!(st.button(BTN_R2));
+    }
+
+    #[test]
+    fn ds3_motion_words_and_short_reports() {
+        let mut r = [0u8; 50];
+        r[0] = 0xa1;
+        r[1] = 0x01;
+        for (offset, value) in [(41, 0u16), (43, 512), (45, 1023), (47, 769)] {
+            r[offset + 1..offset + 3].copy_from_slice(&value.to_be_bytes());
+        }
+        let st = parse_ds3(&r).unwrap();
+        let sensors = st.sensors.unwrap();
+        assert_eq!(sensors.accel, [-512, 0, 511]);
+        assert_eq!(sensors.gyro, [0, 257, 0]);
+        assert_eq!(sensors.touch, [Finger::default(); 2]);
+        for len in 11..50 {
+            let short = parse_ds3(&r[..len]).unwrap();
+            assert_eq!(short.sensors, None, "length {len}");
+            assert_eq!(short.buttons, st.buttons);
+        }
+        // A value outside the 10-bit sensor range must not wrap or overflow.
+        r[42..44].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(parse_ds3(&r).unwrap().sensors, None);
+    }
+
+    #[test]
+    fn ds3_rejects_other_transaction_and_report_identifiers() {
+        let mut report = [0u8; 50];
+        report[..2].copy_from_slice(&[0xa1, 1]);
+        assert!(parse_ds3(&report).is_some());
+        for offset in 0..2 {
+            let original = report[offset];
+            for value in 0..=u8::MAX {
+                if value == original {
+                    continue;
+                }
+                report[offset] = value;
+                assert!(parse_ds3(&report).is_none());
+            }
+            report[offset] = original;
+        }
     }
 
     #[test]
@@ -727,7 +780,7 @@ mod tests {
 
     #[test]
     fn xbox_oldfw_x_button_and_guide() {
-        // old layout: X = m1 bit2 (0x04); guide comes from guide_held
+        // Layout Old uses m1 bit 2 for X. The guide state comes from guide_held.
         let r = xbox_report(0x8000, 0x8000, 0x8000, 0x8000, 0, 0, 0, 0x04, 0);
         let st = parse_xbox(&r, XboxLayout::Old, true).unwrap();
         assert!(st.button(BTN_SQUARE)); // X -> SQUARE

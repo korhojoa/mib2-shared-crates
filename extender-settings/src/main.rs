@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use extender_settings::{base_path, store, wall_ms};
 use std::path::Path;
+mod startup;
 
 fn run() -> Result<String, String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -56,6 +57,7 @@ fn run() -> Result<String, String> {
 }
 
 fn main() {
+    startup::announce();
     let start = std::time::Instant::now();
     match run() {
         Ok(text) => extender_settings::emit(&text),

@@ -19,7 +19,6 @@ pub fn cod_is_gamepad(cod: u32) -> bool {
 }
 
 /// Class-of-Device: major "peripheral" with the keyboard/mouse bits set.
-/// C: `COD_IS_KBM`.
 #[inline]
 #[must_use]
 pub fn cod_is_kbm(cod: u32) -> bool {
@@ -232,15 +231,13 @@ pub enum InquiryAction {
     AutoConnect,
     /// Show it in the interactive discovery list for a human to pick.
     ListInteractive,
-    /// Not a pairing candidate; drop it.
+    /// Ignore the device because it is not a pairing candidate.
     Ignore,
 }
 
-/// Decide what to do with a discovered Classic device. Port of the
-/// `GAP_EVENT_INQUIRY_RESULT` gate: auto-connect ONLY a gamepad-CoD device with
-/// a known controller OUI; `pair_any`/`force_pair` make an unknown device
-/// LISTABLE but never auto-paired (the safety that once stopped a bystander
-/// SHIELD remote being grabbed).
+/// Select the connection policy for a discovered Classic device.
+/// Automatic connection requires a gamepad device class and a known controller OUI.
+/// `pair_any` and `force_pair` permit interactive selection of unknown devices, without automatic pairing.
 #[must_use]
 pub fn classic_inquiry_action(cod: u32, addr: &BdAddr, p: PairPolicy) -> InquiryAction {
     if cod_is_gamepad(cod) {
@@ -301,7 +298,7 @@ pub fn adv_appearance(ad: &[u8]) -> Option<u16> {
 }
 
 /// Does the advertisement carry the HID service (0x1812) in a 16-bit UUID list
-/// (type 0x02/0x03), or a HID-category appearance (0x03Cx)? C: `adv_is_hid`.
+/// (type 0x02/0x03), or a HID-category appearance (0x03Cx)?
 #[must_use]
 pub fn adv_is_hid(ad: &[u8]) -> bool {
     for (ty, data) in ad_fields(ad) {
@@ -322,12 +319,10 @@ pub fn adv_is_hid(ad: &[u8]) -> bool {
     false
 }
 
-/// May we auto-just-works-pair with this LE advertiser? Port of
-/// `le_pair_candidate_ok`: public address only, a known controller OUI, and if
-/// it names a HID appearance it must be GAMEPAD (0x03C4) - a Microsoft BLE
-/// mouse (0x03C2) / keyboard (0x03C1) is rejected even with a controller OUI.
-/// `atype` 0 = public. `pair_any` never bypasses this (it only widens the
-/// interactive list); auto-pair = OUI-verified controllers only, ever.
+/// Check whether an LE advertiser permits automatic pairing.
+/// The address must be public (`atype == 0`) with a known controller OUI.
+/// A HID appearance, when present, must identify a gamepad (0x03C4).
+/// A mouse or keyboard appearance refuses automatic pairing, including devices with a controller OUI.
 #[must_use]
 pub fn le_pair_candidate_ok(addr: &BdAddr, atype: u8, ad: &[u8]) -> bool {
     if atype != 0 {
@@ -344,12 +339,9 @@ pub fn le_pair_candidate_ok(addr: &BdAddr, atype: u8, ad: &[u8]) -> bool {
     true
 }
 
-/// What to do with one LE advertiser - the unified pad/kbm gate (was split
-/// between `le_pair_candidate_ok` in core and `le_kbm_candidate` in the
-/// shell). Precedence: a bonded device reconnects on sight (pad before kbm);
-/// a NEW pad auto-pairs only through the public-address controller-OUI gate;
-/// a NEW keyboard/mouse only under an explicit pairing session (`force_pair`,
-/// i.e. `BTGP_PAIR=1` - no bystander-mouse hijack, ever).
+/// Select the action for an LE advertiser. Bonded devices reconnect, with pads first.
+/// A new pad requires a public address and known controller OUI.
+/// A new keyboard or mouse requires an explicit pairing session (`force_pair`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeAdvAction {
     ConnectPad,
@@ -358,7 +350,7 @@ pub enum LeAdvAction {
 }
 
 #[must_use]
-// Preserve the established shell API for independent pad and keyboard bonds.
+// Pad and keyboard bonds have independent state.
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn le_adv_action(
     addr: &BdAddr,
@@ -404,7 +396,7 @@ pub fn le_adv_action(
 /// NEVER succeed, so the recovery is delete-bond + fresh pairing, once per
 /// connection. Anything else (`CONNECTION_TIMEOUT` 0x08, `REMOTE_USER_TERMINATED`
 /// 0x13, ...) is the link dying before security finished - the bond may be
-/// fine; keep it and let the disconnect path retry the connection.
+/// valid. Keep the bond so the disconnect path can retry the connection.
 #[must_use]
 pub fn reencryption_failure_is_stale_bond(status: u8) -> bool {
     status == 0x05 || status == 0x06
@@ -479,7 +471,7 @@ mod tests {
             InquiryAction::AutoConnect
         );
 
-        // gamepad CoD but unknown OUI: NEVER auto-pair; only listable under flags
+        // An unknown gamepad OUI requires interactive selection when the flags permit it.
         assert_eq!(
             classic_inquiry_action(COD_DS4, &clone_pad, none),
             InquiryAction::Ignore
@@ -489,7 +481,7 @@ mod tests {
             InquiryAction::ListInteractive
         );
 
-        // keyboard: interactive only, off by default; nothing when kbm disabled
+        // Keyboard selection is interactive and disabled by default. Disabled KBM ignores the device.
         assert_eq!(
             classic_inquiry_action(COD_KEYBOARD, &kbd, none),
             InquiryAction::Ignore
@@ -575,7 +567,7 @@ mod tests {
             le_adv_action(&ms, 0, &pad_app, false, false, false, false, closed),
             ConnectPad
         );
-        // NEW mouse: gate closed -> never; gate open -> kbm (appearance or HID)
+        // A new mouse requires an open pairing gate and a keyboard/mouse appearance or HID service.
         assert_eq!(
             le_adv_action(&rnd, 1, &mouse_app, false, false, false, false, closed),
             Ignore
@@ -637,9 +629,8 @@ mod tests {
 }
 
 // --- Meshtastic advertiser identification -----------------------------------
-// The test plan requires selecting the radio by NAME, then confirming that the
-// name's four-hex-digit suffix equals the MAC suffix - never by address alone
-// and never from an unnamed advertisement.
+// Identification requires a name whose four hexadecimal suffix digits match the MAC address.
+// An address alone or an unnamed advertisement does not identify the radio.
 
 /// The Local Name AD field: complete (0x09) wins, shortened (0x08) is taken
 /// only when no complete one is present. `None` for absent or non-UTF-8 names.
@@ -692,7 +683,7 @@ pub fn mesh_name_suffix(name: &str) -> Option<[u8; 4]> {
     ])
 }
 
-/// Plan step 1.4: do the last four hex characters of the MAC, ignoring
+/// Do the last four hex characters of the MAC, ignoring
 /// separators and case, equal the advertised `XXXX`?
 #[must_use]
 pub fn mesh_suffix_matches_addr(suffix: &[u8; 4], addr: &[u8; 6]) -> bool {

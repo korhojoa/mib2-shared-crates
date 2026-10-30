@@ -36,7 +36,7 @@ impl Drop for Temporary {
 
 fn prepare(path: &Path, text: &str, permissions: Permissions) -> Result<Temporary, String> {
     let mut temporary = path.as_os_str().to_os_string();
-    temporary.push(format!(".lsd-stage-{}", std::process::id()));
+    temporary.push(format!(".settings-stage-{}", std::process::id()));
     let temporary = PathBuf::from(temporary);
     // create_new means a leftover file or a link can never be overwritten.
     let mut file = OpenOptions::new()
@@ -54,7 +54,7 @@ fn prepare(path: &Path, text: &str, permissions: Permissions) -> Result<Temporar
 }
 
 pub fn commit(path: &Path, token: &str, edits: &[(String, String)]) -> Result<Snapshot, String> {
-    let lock_path = path.with_extension("lsd-lock");
+    let lock_path = path.with_extension("settings-lock");
     if fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file()) {
         return Err("invalid writer lock file".into());
     }
@@ -82,7 +82,7 @@ pub fn commit(path: &Path, token: &str, edits: &[(String, String)]) -> Result<Sn
         return Err("config is read only".into());
     }
     let staged = prepare(path, &next, permissions.clone())?;
-    let backup = path.with_extension("lsd-backup");
+    let backup = path.with_extension("settings-backup");
     let previous = prepare(&backup, &current.text, permissions)?;
     // A non-cooperating editor is detected before replacing either config.
     if load(path)?.text != current.text {

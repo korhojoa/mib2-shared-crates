@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Rumble: the host->pad half of the shm contract (v4 "BTG4", v5 "BTG5" -
-//! same per-slot command struct, 8 slots instead of 4) - command
-//! dedupe/expiry state and the per-pad-type output-report frame builders.
-//! Pure/sans-IO: the shell reads commands out of the shm, runs them through
-//! [`RumbleState::poll`], and sends the returned frame over the right
-//! transport (Classic interrupt channel / HOGP write).
+//! Controller rumble commands, duplicate suppression, expiry and output report builders.
+//! The caller supplies a coherent [`RumbleCmd`] value to [`RumbleState::poll`].
+//! The caller sends each output frame through the Classic interrupt channel or a HOGP write.
 //!
-//! Frame references (verified against the sources named - NOT from memory):
+//! Output report formats and source references:
 //!
 //! * **DS4 (BT Classic, output report 0x11)** - SDL's vendored hidapi driver
 //!   `SDL/src/joystick/hidapi/SDL_hidapi_ps4.c`
@@ -25,7 +22,7 @@
 //!   `struct sixaxis_output_report` (report body after the id: padding byte,
 //!   `right_duration`, `right_motor_on`, `left_duration`, `left_motor_force`,
 //!   padding[4], `leds_bitmap` at body[9], 4x5-byte LED timing blocks). The right
-//!   (weak) motor is BINARY on/off; the left (strong) takes 0..255.
+//!   right motor has on/off states. The left motor takes values from 0 through 255.
 //!   SDL's `SDL_hidapi_ps3.c` `HIDAPI_DriverPS3_UpdateEffects` confirms the
 //!   scaling: `right ? 1 : 0`, `left = low_frequency >> 8`.
 //! * **Xbox One/Series (BT/BLE, output report 0x03)** - SDL's
@@ -38,8 +35,7 @@
 
 use crate::report::PadType;
 
-/// One decoded command out of the shm `rumble[]` slot (mirrored by
-/// `btsvc_shm::gamepad::Rumble`).
+/// One coherent command value. This type does not specify a shared-memory wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RumbleCmd {
     pub seq: u32,
@@ -53,7 +49,7 @@ pub struct RumbleCmd {
 /// running.
 pub const RUMBLE_CAP_MS: u32 = 5000;
 
-/// What the shell must do this poll.
+/// Output action for the caller in this poll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RumbleAction {
     /// Send the motors these magnitudes.
@@ -169,7 +165,7 @@ pub fn ds4_frame(low: u16, high: u16) -> [u8; 77] {
     p
 }
 
-/// DS3 output report 0x01: the 35-byte payload after the id - the proven
+/// DS3 output report 0x01: the 35-byte payload after the ID with the
 /// `ds3_set_led` frame with the rumble bytes live. Keeps the slot LED lit
 /// (LED N = slot+1), because this frame REPLACES the whole output state.
 #[must_use]
@@ -333,21 +329,21 @@ mod tests {
         assert_eq!(p[2], 0);
         assert_eq!(p[4], 0);
         assert_eq!(p[9], 0x08); // LED 3 (slot 2)
-                                // identical to the daemon's proven LED frame except the durations
+                                // Compare the LED pattern with the duration fields cleared.
         let mut led_only = p;
         led_only[1] = 0x00;
         led_only[3] = 0x00;
-        let daemon_led: [u8; 35] = [
+        let expected_led: [u8; 35] = [
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xff, 0x27, 0x10, 0x00,
             0x32, 0xff, 0x27, 0x10, 0x00, 0x32, 0xff, 0x27, 0x10, 0x00, 0x32, 0xff, 0x27, 0x10,
             0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
-        assert_eq!(led_only, daemon_led);
+        assert_eq!(led_only, expected_led);
     }
 
     #[test]
     fn xbox_frame_golden() {
-        // SDL scales /655 to 0..100; full-scale must land exactly on 100.
+        // Division by 655 scales the input to 0..100. The maximum input must give 100.
         let p = xbox_frame(0xffff, 0x8000);
         assert_eq!(p, [0x0F, 0x00, 0x00, 100, 50, 0xFF, 0x00, 0xEB]);
         let stop = xbox_frame(0, 0);

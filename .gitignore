@@ -1,2 +1,4 @@
 # Cargo build output
 **/target*/
+
+/build/

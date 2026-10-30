@@ -7,9 +7,13 @@ The application supplies the path of `gal_loader.conf` or `dio_loader.conf`
 beside its loaded library. The reader does not write these files. Missing
 keys use the default supplied by the calling application.
 
-Both readers use signed decimal integer prefixes. Leading zeroes are decimal.
-The first matching key wins. A value with no numeric prefix uses the caller
-fallback. Overflow selects the nearest signed 32-bit bound.
+Both readers accept only complete signed decimal integers.
+Spaces and tabs around a value are permitted. Leading zeroes stay decimal.
+
+The first matching key wins. A missing key or an invalid value uses the caller's default.
+An empty value is invalid. Overflow selects the nearest signed 32-bit bound.
+The checked reader returns the refused text.
+The CarPlay loader logs each refused key once, with its text.
 
 | Key | Type | Minimum | Maximum | Default | Meaning |
 | --- | --- | --- | --- | --- | --- |
@@ -63,3 +67,21 @@ that it supplies valid credentials on every firmware.
 The other libraries accept arguments through their Rust APIs. They have no
 loader configuration file. The `file-checksum FILE...` command reads only
 its file arguments.
+
+## Optional card location publisher
+
+The card location publisher is not part of the public packages.
+The optional settings commands can read its PPS record when it is present.
+Without that publisher, the library uses the explicit caller path or the folder beside the loaded component.
+The `location::publish_from_hmi` API supplies the publisher side for applications that implement this contract.
+
+The CarPlay editor uses a `.settings-lock` file and saves a `.settings-backup` file beside the configuration.
+Temporary files use `.settings-stage-` and the process ID.
+The reader and writer use only the `carplay-settings` override markers.
+
+The optional publisher contract uses `<PPS root>/extender-settings/card`.
+`GAL_PPS_ROOT` selects the PPS root. The default is `/ramdisk/pps`.
+The record contains `version::1`, `pid::<publisher PID>`, `dir::<absolute directory>` and `end::1`.
+The reader requires a live publisher process and an existing absolute directory.
+`EXTENDER_SETTINGS_PARENT_PID` enables publication through `location::publish_from_hmi`.
+Its value must equal the helper's actual parent PID. Without this variable, that function writes nothing.

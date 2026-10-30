@@ -1,6 +1,6 @@
 [package]
 name = "extender-settings"
-version = "0.2.0"
+version = "0.3.4+1"
 edition = "2021"
 description = "Shared Android Auto and CarPlay settings model, stores and native reader API"
 license = "MIT OR Apache-2.0"
@@ -17,3 +17,6 @@ path = "src/main.rs"
 [[bin]]
 name = "carplay-settings"
 path = "src/dio_main.rs"
+
+[dependencies]
+qnx-slog = { git = "https://github.com/korhojoa/qnx650-crates.git", rev = "fa8dd2a4c9c19212bf7c868f375eee2bc6534ecb", features = ["static-slogf"] }

@@ -70,14 +70,46 @@ pub fn config_path(name: &str) -> Result<PathBuf, String> {
     beside(&loaded_path()?, name)
 }
 
+/// Resolve the AA base independently of the helper install folder. A fresh
+/// running reader is authoritative. Otherwise use an adjacent base or the
+/// single GAL install found on mounted media; never guess between two installs.
+pub fn android_auto_config_path() -> Result<PathBuf, String> {
+    if let Some(base) = live_base() {
+        return Ok(base);
+    }
+    android_auto_base_for(&loaded_path()?, Path::new("/fs"))
+}
+
+fn android_auto_base_for(component: &Path, mounts: &Path) -> Result<PathBuf, String> {
+    let adjacent = beside(component, "gal_loader.conf")?;
+    if adjacent.is_file() {
+        return Ok(adjacent);
+    }
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(mounts) {
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("cannot inspect mounted media: {e}"))?;
+            let base = entry.path().join("gal-extender/gal_loader.conf");
+            if base.is_file() {
+                candidates.push(base);
+            }
+        }
+    }
+    match candidates.as_slice() {
+        [base] => Ok(base.clone()),
+        [] => Err("GAL config unavailable beside the helper or on mounted media".into()),
+        _ => Err("multiple GAL configs on mounted media; select one with --base".into()),
+    }
+}
+
 pub fn pps_root() -> PathBuf {
     std::env::var_os("GAL_PPS_ROOT").map_or_else(|| PathBuf::from("/ramdisk/pps"), PathBuf::from)
 }
 
 fn object_path() -> PathBuf {
-    pps_root().join("lsdextender/card")
+    pps_root().join("extender-settings/card")
 }
-const PARENT_ENV: &str = "LSD_SETTINGS_HMI_PID";
+const PARENT_ENV: &str = "EXTENDER_SETTINGS_PARENT_PID";
 
 fn fields(text: &str) -> std::collections::BTreeMap<&str, &str> {
     text.lines()
@@ -174,6 +206,35 @@ pub fn publish_from_hmi(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aa_helper_on_other_card_slot_finds_the_gal_install_and_refuses_ambiguity() {
+        let root = std::env::temp_dir().join(format!("aa-card-layout-{}", std::process::id()));
+        let mounts = root.join("fs");
+        let helper = mounts.join("sdb0/lsd-extender/android-auto-settings");
+        let gal = mounts.join("sda0/gal-extender/gal_loader.conf");
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(gal.parent().unwrap()).unwrap();
+        std::fs::write(&gal, "cluster\n").unwrap();
+        assert_eq!(android_auto_base_for(&helper, &mounts).unwrap(), gal);
+        let second = mounts.join("sdb0/gal-extender/gal_loader.conf");
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&second, "sensor\n").unwrap();
+        assert!(android_auto_base_for(&helper, &mounts)
+            .unwrap_err()
+            .contains("multiple GAL configs"));
+        std::fs::remove_file(&gal).unwrap();
+        assert_eq!(android_auto_base_for(&helper, &mounts).unwrap(), second);
+        let adjacent = helper.with_file_name("gal_loader.conf");
+        std::fs::write(&adjacent, "input\n").unwrap();
+        assert_eq!(android_auto_base_for(&helper, &mounts).unwrap(), adjacent);
+        std::fs::remove_file(adjacent).unwrap();
+        std::fs::remove_file(second).unwrap();
+        assert!(android_auto_base_for(&helper, &mounts)
+            .unwrap_err()
+            .contains("unavailable"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn config_names_stay_beside_the_loaded_component() {

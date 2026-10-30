@@ -23,7 +23,7 @@ pub enum PinCheck<'a> {
     FirstUse,
     /// The stored fingerprint is the one in front of us.
     Match,
-    /// A line exists and names a DIFFERENT key. Refuse; do not overwrite.
+    /// A line names a different or malformed key. Refuse; do not overwrite.
     Changed(&'a str),
 }
 
@@ -40,14 +40,13 @@ pub enum PinCheck<'a> {
 /// certificate being reissued around the same key.
 ///
 /// The first line naming a peer decides, so a duplicate appended later cannot
-/// quietly override a pin. A malformed line is skipped rather than trusted: it
-/// can never produce a match, and treating it as absent would turn a typo into
-/// re-adoption of whatever answers next.
+/// override a pin. A malformed named entry returns `Changed`, including an
+/// empty fingerprint. It cannot permit first use or a later duplicate match.
 #[must_use]
 pub fn check_pin<'a>(store: &'a str, name: &str, fp_hex: &str) -> PinCheck<'a> {
     for (who, hex) in store_lines(store) {
         if who == name {
-            return if hex == fp_hex {
+            return if valid_fingerprint(hex) && hex == fp_hex {
                 PinCheck::Match
             } else {
                 PinCheck::Changed(hex)
@@ -63,22 +62,20 @@ pub fn is_pinned(store: &str, name: &str) -> bool {
     store_lines(store).any(|(who, _)| who == name)
 }
 
+fn valid_fingerprint(hex: &str) -> bool {
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn store_lines(store: &str) -> impl Iterator<Item = (&str, &str)> {
     store.lines().filter_map(|line| {
         let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            return None;
-        }
         let mut parts = line.split_whitespace();
-        let (who, fp) = (parts.next()?, parts.next()?);
-        let hex = fp.strip_prefix("sha256:")?;
-        if hex.len() != 64
-            || !hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return None;
-        }
+        let who = parts.next()?;
+        let fingerprint = parts.next().unwrap_or("");
+        let hex = fingerprint.strip_prefix("sha256:").unwrap_or("");
         Some((who, hex))
     })
 }
@@ -106,7 +103,7 @@ mod tests {
     /// A malformed line must not read as "no pin": that would re-adopt whatever
     /// answered next, which is the one thing the store exists to prevent.
     #[test]
-    fn malformed_lines_never_match_and_never_pin() {
+    fn malformed_lines_reserve_the_name_and_never_match() {
         let fp = "c".repeat(64);
         for bad in [
             "headunit",
@@ -120,7 +117,7 @@ mod tests {
                 PinCheck::Match,
                 "matched {bad:?}"
             );
-            assert!(!is_pinned(bad, "headunit"), "pinned from {bad:?}");
+            assert!(is_pinned(bad, "headunit"), "lost named pin {bad:?}");
         }
     }
 
@@ -142,5 +139,20 @@ mod tests {
         hex64(&mut out, &digest);
         let s = core::str::from_utf8(&out).unwrap();
         assert!(s.starts_with("de00") && s.ends_with("000f"), "{s}");
+    }
+    #[test]
+    fn a_malformed_named_pin_refuses_readoption_and_later_duplicates() {
+        let fp = "a".repeat(64);
+        for bad in ["peer", "peer sha256:bad", "peer md5:abcd"] {
+            assert!(!matches!(
+                check_pin(bad, "peer", &fp),
+                PinCheck::FirstUse | PinCheck::Match
+            ));
+            let duplicate = format!("{bad}\npeer sha256:{fp}\n");
+            assert!(!matches!(
+                check_pin(&duplicate, "peer", &fp),
+                PinCheck::FirstUse | PinCheck::Match
+            ));
+        }
     }
 }

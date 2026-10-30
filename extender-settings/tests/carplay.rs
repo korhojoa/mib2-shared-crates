@@ -40,16 +40,16 @@ impl Drop for Fixture {
 #[test]
 fn first_key_uses_shared_decimal_integer() {
     for (text, value) in [
-        ("x=0x10", 0),
-        ("x=-020 # decimal", -20),
+        ("x=0x10", 7),
+        ("x=-020 # decimal", 7),
         ("x=08", 8),
-        ("x=  +19tail", 19),
+        ("x=  +19tail", 7),
         ("x=bad\nx=3", 7),
         ("x =5\nx=9", 5),
         ("#x=12\r\n\tx=17\r", 17),
         ("x=4294967295", i32::MAX),
         ("x=-4294967295", i32::MIN),
-        ("x=0xjunk", 0),
+        ("x=0xjunk", 7),
     ] {
         assert_eq!(carplay::base_int(text, "x", 7), value, "{text}");
     }
@@ -74,7 +74,7 @@ fn saves_survive_reopen_and_default_restores_exact_original() {
         30
     );
     assert_eq!(
-        fs::read_to_string(f.file.with_extension("lsd-backup")).unwrap(),
+        fs::read_to_string(f.file.with_extension("settings-backup")).unwrap(),
         original
     );
     assert!(saved.protocol().contains("\t30\t25\t1\t60\t1\t0\t0\n"));
@@ -103,7 +103,7 @@ fn rejects_malformed_sections_and_native_buffer_overflow() {
         format!("{BEGIN}cluster_enable=1\n"),
         format!("{BEGIN}x=1\nx=2\n{END}"),
         format!("# extra\n{BEGIN}{END}"),
-        "# lsd-extender CarPlay overrides v2\n".into(),
+        "# carplay-settings overrides v2\n".into(),
         "x=1\0".into(),
     ] {
         assert!(Snapshot::parse(text).is_err());
@@ -272,12 +272,9 @@ fn missing_config_is_absent_not_an_error() {
     // Saving still needs an existing config.
     assert!(carplay::load(&missing).is_err());
     assert!(carplay::load_present(&f.file).unwrap().is_some());
+
     assert_eq!(
-        carplay::absent_protocol(&carplay::absent_text("auto", &missing)),
-        format!("absent\t{}\nend\t1\n", missing.display())
-    );
-    assert_eq!(
-        carplay::absent_protocol(&carplay::absent_text("/x/a\tb.conf", &missing)),
+        carplay::absent_protocol(&carplay::absent_text(&missing)),
         format!("absent\t{}\nend\t1\n", missing.display())
     );
 }
@@ -304,7 +301,7 @@ fn fixed_native_severity_is_not_an_editable_setting() {
     for value in ["0", "7", "8", "inherit"] {
         assert!(f.save("log_level", value).is_err());
         assert_eq!(fs::read_to_string(&f.file).unwrap(), original);
-        assert!(!f.file.with_extension("lsd-backup").exists());
+        assert!(!f.file.with_extension("settings-backup").exists());
     }
     let saved = f.save("altscreen_max_fps", "35").unwrap();
     assert_eq!(saved.base, original);

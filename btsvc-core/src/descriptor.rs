@@ -3,8 +3,7 @@
 //! All descriptor helpers use the same item iterator.
 
 /// One short HID item. `value` is the little-endian data bytes (bounded by the
-/// buffer); `size` is the declared data size (0,1,2,4). Long items (`0xfe`) are
-/// skipped, matching the C `i += 1 + d[i]` handling.
+/// buffer). `size` is the declared data size (0, 1, 2, 4). The iterator skips long items (`0xfe`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Item {
     /// bType: 0 main, 1 global, 2 local, 3 reserved.
@@ -23,12 +22,15 @@ pub fn items(descriptor: &[u8]) -> impl Iterator<Item = Item> + '_ {
             let prefix = descriptor[offset];
             offset += 1;
             if prefix == 0xfe {
-                // Long item: C reads descriptor[offset] as the size and skips 1 + size.
-                if offset >= descriptor.len() {
+                // A long item has a size byte, a tag byte and its payload.
+                if descriptor.len() - offset < 2 {
                     return None;
                 }
                 let long_size = descriptor[offset] as usize;
-                offset = offset.saturating_add(1 + long_size);
+                offset = offset.checked_add(2 + long_size)?;
+                if offset > descriptor.len() {
+                    return None;
+                }
                 continue;
             }
             let item_size = match prefix & 3 {
@@ -59,7 +61,7 @@ pub fn has_report_id(d: &[u8]) -> bool {
     items(d).any(|it| it.itype == 1 && it.tag == 8)
 }
 
-/// The first Report ID declared (0 if none). C: `desc_first_report_id`.
+/// Return the first declared Report ID, or zero when absent.
 #[must_use]
 pub fn first_report_id(d: &[u8]) -> u8 {
     for it in items(d) {
@@ -71,7 +73,6 @@ pub fn first_report_id(d: &[u8]) -> u8 {
 }
 
 /// Does the descriptor declare Generic-Desktop X (0x30) and Y (0x31)?
-/// C: `desc_has_xy`.
 #[must_use]
 pub fn has_xy(d: &[u8]) -> bool {
     let mut page = 0u32;
@@ -91,7 +92,7 @@ pub fn has_xy(d: &[u8]) -> bool {
 }
 
 /// The Report ID whose INPUT item carries Generic-Desktop X/Y - the
-/// mouse-motion report. 0 if none/no ids. C: `desc_report_id_with_xy`.
+/// mouse-motion report. Return zero when absent or when no IDs exist.
 #[must_use]
 pub fn report_id_with_xy(d: &[u8]) -> u8 {
     let mut page = 0u32;
@@ -139,7 +140,6 @@ pub fn report_id_with_xy(d: &[u8]) -> u8 {
 }
 
 /// Application-collection usages present: keyboard, mouse, gamepad.
-/// C: `desc_app_usages`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppUsages {
     pub kbd: bool,
@@ -147,8 +147,7 @@ pub struct AppUsages {
     pub pad: bool,
 }
 
-/// Classify a descriptor by its Collection(Application) usages. C:
-/// `desc_app_usages`.
+/// Classify a descriptor by its Collection(Application) usages.
 #[must_use]
 pub fn app_usages(d: &[u8]) -> AppUsages {
     let mut page = 0u32;
@@ -287,8 +286,12 @@ mod tests {
 
     #[test]
     fn long_item_is_skipped() {
-        // 0xfe, size=2, 2 data bytes, then a real Report ID item
-        let d = &[0xfe, 0x02, 0xaa, 0xbb, 0x85, 0x07];
+        // Long item: prefix, size, tag, payload, then a Report ID.
+        let d = &[0xfe, 0x02, 0xaa, 0x01, 0x02, 0x85, 0x07];
         assert_eq!(first_report_id(d), 7);
+        for n in 0..5 {
+            assert_eq!(items(&d[..n]).count(), 0);
+        }
+        assert_eq!(first_report_id(&[0xfe, 0, 0xaa, 0x85, 7]), 7);
     }
 }

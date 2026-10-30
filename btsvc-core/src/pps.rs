@@ -20,6 +20,9 @@ const KEYS: &[&str] = &[
     "end",
 ];
 
+const SELECTED: usize = 5;
+const ALLOW: usize = 6;
+
 pub struct Text {
     bytes: [u8; 4096],
     len: usize,
@@ -61,13 +64,24 @@ impl Text {
     }
 }
 
+/// Remove PPS object and attribute qualifiers without changing field values.
+#[must_use]
+pub fn content(mut line: &str) -> Option<&str> {
+    while let Some(flags) = line.strip_prefix('[') {
+        let (_, rest) = flags.split_once(']')?;
+        line = rest;
+    }
+    Some(line)
+}
+
 #[must_use]
 pub fn decode(text: &str) -> Option<Text> {
     if text.len() > 4096 || !text.is_ascii() {
         return None;
     }
-    let mut fields = [None; 18];
+    let mut fields = [None; KEYS.len()];
     for line in text.lines() {
+        let line = content(line)?;
         if line.starts_with('@') || line.is_empty() {
             continue;
         }
@@ -97,6 +111,8 @@ pub fn decode(text: &str) -> Option<Text> {
     Some(flat)
 }
 
+/// Preserve explicit allow entries without a selected peer.
+/// A selected peer without allow entries writes an empty allow list.
 #[must_use]
 pub fn encode(flat: &str) -> Option<Text> {
     if flat.len() > 4096 || !flat.is_ascii() {
@@ -104,11 +120,12 @@ pub fn encode(flat: &str) -> Option<Text> {
     }
     let mut pps = Text::default();
     let mut allowed = Text::default();
-    let mut names = [false; 18];
+    let mut names = [false; KEYS.len()];
     for line in flat.lines() {
         let (name, value) = line.split_once('=')?;
         let i = KEYS.iter().position(|key| *key == name)?;
-        if name == "allow" {
+        if i == ALLOW {
+            names[ALLOW] = true;
             if !allowed.is_empty() {
                 allowed.push(",")?;
             }
@@ -124,7 +141,7 @@ pub fn encode(flat: &str) -> Option<Text> {
             pps.push("\n")?;
         }
     }
-    if names[5] {
+    if names[SELECTED] || names[ALLOW] {
         pps.push("allow::")?;
         pps.push(allowed.as_str())?;
         pps.push("\n")?;
@@ -135,6 +152,13 @@ pub fn encode(flat: &str) -> Option<Text> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualified_object_and_attribute_lines_decode() {
+        let decoded = decode("[n]@policy\n[n]version::1\nrevision::2\n").unwrap();
+        assert_eq!(decoded.as_str(), "version=1\nrevision=2\n");
+        assert!(decode("[n@policy\nversion::1\n").is_none());
+        assert!(decode("[n]epoch::1\nepoch::2\n").is_none());
+    }
     #[test]
     fn roundtrip_sorts_pps_and_clears_old_permissions() {
         let flat = "version=1\nrevision=2\nepoch=3\nupdated_ms=1000\nenabled=1\nselected=01:23:45:67:89:AB\nallow=01:23:45:67:89:AB\nend=1\n";
@@ -147,5 +171,11 @@ mod tests {
             .as_str()
             .contains("allow::\n"));
         assert!(decode("@policy\nepoch::1\nepoch::2\n").is_none());
+    }
+    #[test]
+    fn allow_only_policy_survives_without_a_selected_peer() {
+        let flat = "allow=02:00:00:00:00:01\nallow=02:00:00:00:00:02\n";
+        let encoded = encode(flat).unwrap();
+        assert_eq!(decode(encoded.as_str()).unwrap().as_str(), flat);
     }
 }

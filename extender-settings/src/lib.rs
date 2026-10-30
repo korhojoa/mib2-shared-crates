@@ -4,11 +4,13 @@ pub mod card_mount;
 pub mod carplay;
 mod carplay_store;
 pub mod config;
+pub mod live;
 pub mod location;
 pub mod pps;
 mod runtime;
 pub mod schema;
 pub mod store;
+pub use runtime::install_live_apply;
 pub use runtime::snapshot_text;
 
 pub const ABI: u32 = 1;
@@ -19,9 +21,9 @@ pub const SETTINGS_DIR_KEY: &str = "extender_settings_dir";
 /// Android Auto reader status in its existing protocol-specific PPS domain.
 /// The loader passes this path to `extender_settings_init`.
 pub const ANDROID_AUTO_STATUS: &str = "/ramdisk/pps/gal/settings_active";
-/// Resolve the Android Auto config beside this loaded component.
+/// Resolve the AA base from the running reader, adjacent file or mounted GAL install.
 pub fn base_path() -> Result<std::path::PathBuf, String> {
-    location::config_path("gal_loader.conf")
+    location::android_auto_config_path()
 }
 
 /// The value of `key=` in conf text, by the integer-key rules (white space
@@ -107,10 +109,10 @@ mod tests {
         assert_eq!(conf_str("cluster\naa_rx_log=1\n", SETTINGS_DIR_KEY), None);
         assert_eq!(
             conf_str(
-                "# extender_settings_dir=/a\n  extender_settings_dir = /hd/lsd \r\n",
+                "# extender_settings_dir=/a\n  extender_settings_dir = /hd/settings-data \r\n",
                 SETTINGS_DIR_KEY
             ),
-            Some("/hd/lsd")
+            Some("/hd/settings-data")
         );
         assert_eq!(
             conf_str(

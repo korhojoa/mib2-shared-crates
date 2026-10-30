@@ -7,7 +7,7 @@
 
 /// Frame header length.
 pub const HEADER_LEN: usize = 4;
-/// RFCOMM MTU the shell registers with; also bounds our frame buffers.
+/// RFCOMM MTU for the caller and maximum frame buffer size.
 pub const RFCOMM_MTU: usize = 512;
 
 /// `MessageId` (aa-proxy-rs `MessageId` enum).
@@ -29,7 +29,7 @@ pub const SEC_WPA2_PERSONAL: u32 = 8;
 /// WifiInfoResponse.AccessPointType DYNAMIC.
 pub const AP_TYPE_DYNAMIC: u32 = 1;
 
-// --- proto2 primitives (LEB128 varint; wire types 0 and 2 only) -------------
+// Proto2 primitives use LEB128 varints and wire types 0 and 2.
 
 fn put_varint(out: &mut [u8], off: &mut usize, mut v: u32) -> Option<()> {
     loop {
@@ -115,7 +115,7 @@ pub fn encode_wifi_start_request(out: &mut [u8], ip: &str, port: u32) -> Option<
 }
 
 /// `WifiInfoResponse` `{ ssid=1, key=2, bssid=3, security_mode=4, ap_type=5 }`.
-/// Note: key=2/bssid=3 is the aa-proxy-rs (runtime-proven) order; see module doc.
+/// The payload uses key field 2 and BSSID field 3.
 pub fn encode_wifi_info_response(
     out: &mut [u8],
     ssid: &str,
@@ -146,7 +146,7 @@ pub fn wifi_connect_status_ok(payload: &[u8]) -> Option<bool> {
 // --- handshake state machine (HU role) ---------------------------------------
 
 /// The strings the handshake hands the phone. Borrowed per-call so the core
-/// stays allocation-free; the shell owns the storage.
+/// stays allocation-free. The caller owns the storage.
 #[derive(Clone, Copy)]
 pub struct Cfg<'a> {
     /// TCP endpoint the phone connects to for the AA session (uap0 gateway).
@@ -176,7 +176,7 @@ pub enum Stage {
 pub enum Outcome {
     /// Nothing decisive - handshake still in progress.
     Pending,
-    /// Stage 5 OK: the phone joined Wi-Fi; the AA session lands on ip:port.
+    /// Stage 5 succeeded: the phone joined Wi-Fi. The Android Auto session uses ip:port.
     Pass,
     /// The phone reported a Wi-Fi join failure (stage machine resets to Idle).
     Fail,
@@ -213,8 +213,8 @@ impl Authorization {
 }
 
 /// One AAWG RFCOMM session: rx reassembly + the 5-stage ping-pong. The `tx`
-/// sink receives complete encoded frames; the protocol is strictly ping-pong,
-/// so at most one frame is emitted per call (the shell's one-frame queue is
+/// sink receives complete encoded frames. The protocol uses request-response pairs,
+/// so at most one frame is emitted per call (the caller's one-frame queue is
 /// sufficient).
 pub struct Conn {
     stage: Stage,
@@ -263,7 +263,7 @@ impl Conn {
     }
 
     /// Inbound RFCOMM bytes (arbitrary chunk boundaries). Reassembles frames
-    /// and advances the stage machine; emits at most one response frame.
+    /// and advances the state machine. It emits at most one response frame.
     pub fn on_data(&mut self, cfg: &Cfg, data: &[u8], tx: &mut impl FnMut(&[u8])) -> Outcome {
         if self.rx_len + data.len() > self.rx.len() {
             self.rx_len = 0; // Reset reassembly on overflow.
@@ -336,8 +336,8 @@ impl Conn {
                     Outcome::Pending
                 }
             }
-            // Idle/Done: WifiVersionRequest / WifiPingRequest may arrive; the
-            // proven minimal path (aa-proxy-rs send_params) ignores them.
+            // Idle and Done can receive WifiVersionRequest or WifiPingRequest.
+            // These optional requests leave the state unchanged.
             _ => Outcome::Pending,
         }
     }
@@ -380,7 +380,7 @@ mod tests {
             &mut |_| {},
         ));
         assert!(authorization.granted());
-        conn.reset(); // the shell clears channel state on ordinary RFCOMM close
+        conn.reset(); // the caller clears channel state on ordinary RFCOMM close
         assert!(
             authorization.granted(),
             "successful data-plane grant outlives RFCOMM"
@@ -580,7 +580,7 @@ mod tests {
     }
 
     /// Pings/version requests out of turn are ignored (the `send_params` minimal
-    /// path); garbage that overflows the rx buffer resyncs instead of panicking.
+    /// path). Input that exceeds the receive buffer causes resynchronization, without a panic.
     #[test]
     fn ignores_unexpected_and_survives_garbage() {
         let cfg = cfg();

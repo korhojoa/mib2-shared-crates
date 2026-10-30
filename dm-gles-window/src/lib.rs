@@ -15,7 +15,9 @@
 
 pub mod yuv;
 
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use std::rc::{Rc, Weak};
 
 type Ptr = *mut c_void;
 
@@ -50,6 +52,15 @@ macro_rules! api {
                     }
                 }),* })
             }
+            #[cfg(test)]
+            fn test_stub() -> Self {
+                Self { $($f: {
+                    unsafe extern "C" fn stub($(_: $a),*) $(-> $r)? {
+                        Default::default()
+                    }
+                    stub
+                }),* }
+            }
         }
     };
 }
@@ -64,8 +75,11 @@ api!(
         eglCreateContext: fn(Ptr, Ptr, Ptr, *const c_int) -> Ptr,
         eglCreateWindowSurface: fn(Ptr, Ptr, Ptr, *const c_int) -> Ptr,
         eglMakeCurrent: fn(Ptr, Ptr, Ptr, Ptr) -> c_uint,
+        eglGetCurrentContext: fn() -> Ptr,
         eglSwapBuffers: fn(Ptr, Ptr) -> c_uint,
         eglGetError: fn() -> c_int,
+        eglDestroySurface: fn(Ptr, Ptr) -> c_uint,
+        eglDestroyContext: fn(Ptr, Ptr) -> c_uint,
     }
 );
 
@@ -73,12 +87,15 @@ api!(
     /// The GLES2 entry points available to callers through [`Window::gl`].
     Gles {
         glCreateShader: fn(c_uint) -> c_uint,
+        glDeleteShader: fn(c_uint),
         glShaderSource: fn(c_uint, c_int, *const *const c_char, *const c_int),
         glCompileShader: fn(c_uint),
         glGetShaderiv: fn(c_uint, c_uint, *mut c_int),
         glGetShaderInfoLog: fn(c_uint, c_int, *mut c_int, *mut c_char),
         glCreateProgram: fn() -> c_uint,
         glAttachShader: fn(c_uint, c_uint),
+        glDetachShader: fn(c_uint, c_uint),
+        glDeleteProgram: fn(c_uint),
         glBindAttribLocation: fn(c_uint, c_uint, *const c_char),
         glLinkProgram: fn(c_uint),
         glGetProgramiv: fn(c_uint, c_uint, *mut c_int),
@@ -149,16 +166,101 @@ static QUAD: [f32; 16] = [
     1.0, -1.0, 1.0, 1.0,
 ];
 
+struct Shader<'a> {
+    id: c_uint,
+    gl: &'a Gles,
+}
+impl Drop for Shader<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this temporary stays inside compilation in the current context.
+        unsafe {
+            (self.gl.glDeleteShader)(self.id);
+        }
+    }
+}
+struct Programs {
+    ids: RefCell<Vec<c_uint>>,
+    current: unsafe extern "C" fn() -> Ptr,
+    delete: unsafe extern "C" fn(c_uint),
+    context: Ptr,
+    live: Cell<bool>,
+}
+impl Programs {
+    fn new(egl: &Egl, gl: &Gles, context: Ptr) -> Rc<Self> {
+        Rc::new(Self {
+            ids: RefCell::new(Vec::new()),
+            current: egl.eglGetCurrentContext,
+            delete: gl.glDeleteProgram,
+            context,
+            live: Cell::new(true),
+        })
+    }
+    fn release(&self, id: c_uint) {
+        // SAFETY: the function table is process-scoped. Never delete in another context.
+        if self.live.get() && unsafe { (self.current)() } == self.context {
+            let mut ids = self.ids.borrow_mut();
+            if let Some(index) = ids.iter().position(|p| *p == id) {
+                ids.swap_remove(index);
+                // SAFETY: this ID belongs to the current live context.
+                unsafe {
+                    (self.delete)(id);
+                }
+            }
+        }
+    }
+}
+struct Program {
+    id: c_uint,
+    owner: Weak<Programs>,
+}
+impl Drop for Program {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release(self.id);
+        }
+    }
+}
+
 /// The window, its EGL surface and a current GLES2 context. Use it from the
-/// thread that created it.
+/// thread that created it. Drop releases its EGL surface and context.
+/// Native display windows and library handles remain process-scoped.
 pub struct Window {
+    programs: Rc<Programs>,
     egl: Egl,
     /// The GLES2 functions, for callers that draw their own content.
     pub gl: Gles,
     dpy: Ptr,
     surface: Ptr,
+    context: Ptr,
     pub w: i32,
     pub h: i32,
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // SAFETY: these are this window's handles, released on its creating thread.
+        // A partially constructed window can own a context without a surface.
+        unsafe {
+            if !self.context.is_null() && (self.egl.eglGetCurrentContext)() == self.context {
+                for program in self.programs.ids.borrow_mut().drain(..) {
+                    (self.gl.glDeleteProgram)(program);
+                }
+                (self.egl.eglMakeCurrent)(
+                    self.dpy,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+            self.programs.live.set(false);
+            if !self.surface.is_null() {
+                (self.egl.eglDestroySurface)(self.dpy, self.surface);
+            }
+            if !self.context.is_null() {
+                (self.egl.eglDestroyContext)(self.dpy, self.context);
+            }
+        }
+    }
 }
 
 fn open(path: &CStr) -> Result<Ptr, String> {
@@ -172,6 +274,20 @@ fn open(path: &CStr) -> Result<Ptr, String> {
 }
 
 impl Window {
+    #[cfg(test)]
+    fn test_window() -> Self {
+        Self {
+            programs: Programs::new(&Egl::test_stub(), &Gles::test_stub(), std::ptr::null_mut()),
+            egl: Egl::test_stub(),
+            gl: Gles::test_stub(),
+            dpy: std::ptr::null_mut(),
+            surface: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+            w: 1,
+            h: 1,
+        }
+    }
+
     /// Create the window (claiming displayable `id`, RGB565), its EGL
     /// surface and a current ES2 context, and clear it to black.
     pub fn new(id: i32, w: i32, h: i32) -> Result<Self, String> {
@@ -225,6 +341,16 @@ impl Window {
                     (egl.eglGetError)()
                 ));
             }
+            let mut win = Window {
+                programs: Programs::new(&egl, &gl, ctx),
+                egl,
+                gl,
+                dpy,
+                surface: std::ptr::null_mut(),
+                context: ctx,
+                w,
+                h,
+            };
             let mut native: Ptr = std::ptr::null_mut();
             let mut kd: Ptr = std::ptr::null_mut();
             create(dpy, config, w, h, id, &mut native, &mut kd);
@@ -233,25 +359,20 @@ impl Window {
                     "display_create_window({w}x{h}, id {id}) gave no window"
                 ));
             }
-            let surface = (egl.eglCreateWindowSurface)(dpy, config, native, std::ptr::null());
-            if surface.is_null() {
+            win.surface = (win.egl.eglCreateWindowSurface)(dpy, config, native, std::ptr::null());
+            if win.surface.is_null() {
                 return Err(format!(
                     "eglCreateWindowSurface failed 0x{:x}",
-                    (egl.eglGetError)()
+                    (win.egl.eglGetError)()
                 ));
             }
-            if (egl.eglMakeCurrent)(dpy, surface, surface, ctx) == 0 {
-                return Err(format!("eglMakeCurrent failed 0x{:x}", (egl.eglGetError)()));
+            if (win.egl.eglMakeCurrent)(dpy, win.surface, win.surface, ctx) == 0 {
+                return Err(format!(
+                    "eglMakeCurrent failed 0x{:x}",
+                    (win.egl.eglGetError)()
+                ));
             }
-            (gl.glViewport)(0, 0, w, h);
-            let win = Window {
-                egl,
-                gl,
-                dpy,
-                surface,
-                w,
-                h,
-            };
+            (win.gl.glViewport)(0, 0, w, h);
             win.clear();
             Ok(win)
         }
@@ -274,11 +395,16 @@ impl Window {
         self.swap();
     }
 
-    fn shader(&self, kind: c_uint, src: &CStr) -> Result<c_uint, String> {
+    fn shader(&self, kind: c_uint, src: &CStr) -> Result<Shader<'_>, String> {
         let g = &self.gl;
         // SAFETY: current context; NUL-terminated source, length -1.
         unsafe {
-            let s = (g.glCreateShader)(kind);
+            let id = (g.glCreateShader)(kind);
+            if id == 0 {
+                return Err("shader allocation failed".into());
+            }
+            let shader = Shader { id, gl: g };
+            let s = shader.id;
             let p = src.as_ptr();
             (g.glShaderSource)(s, 1, &p, std::ptr::null());
             (g.glCompileShader)(s);
@@ -291,13 +417,14 @@ impl Window {
                 let msg = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
                 return Err(format!("shader compile failed: {msg}"));
             }
-            Ok(s)
+            Ok(shader)
         }
     }
 
     /// Compile and link a program from a vertex and a fragment shader, with
     /// `pos` bound to attribute 0 and `tc` to attribute 1 (see
-    /// [`Window::draw_quad`]). The program is left in use.
+    /// [`Window::draw_quad`]). The program is left in use and owned by this window.
+    /// Use [`Window::delete_program`] to release it before window destruction.
     pub fn program(&self, vs: &CStr, fs: &CStr) -> Result<c_uint, String> {
         let vs = self.shader(GL_VERTEX_SHADER, vs)?;
         let fs = self.shader(GL_FRAGMENT_SHADER, fs)?;
@@ -305,8 +432,11 @@ impl Window {
         // SAFETY: current context; valid shader objects.
         unsafe {
             let p = (g.glCreateProgram)();
-            (g.glAttachShader)(p, vs);
-            (g.glAttachShader)(p, fs);
+            if p == 0 {
+                return Err("program allocation failed".into());
+            }
+            (g.glAttachShader)(p, vs.id);
+            (g.glAttachShader)(p, fs.id);
             (g.glBindAttribLocation)(p, 0, c"pos".as_ptr());
             (g.glBindAttribLocation)(p, 1, c"tc".as_ptr());
             (g.glLinkProgram)(p);
@@ -317,10 +447,27 @@ impl Window {
                 let mut n = 0;
                 (g.glGetProgramInfoLog)(p, buf.len() as c_int, &mut n, buf.as_mut_ptr());
                 let msg = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+                (g.glDeleteProgram)(p);
                 return Err(format!("program link failed: {msg}"));
             }
+            (g.glDetachShader)(p, vs.id);
+            (g.glDetachShader)(p, fs.id);
+            self.programs.ids.borrow_mut().push(p);
             (g.glUseProgram)(p);
             Ok(p)
+        }
+    }
+
+    /// Release an unused program while this window's context is current.
+    /// Otherwise, context destruction releases the program.
+    pub fn delete_program(&self, program: c_uint) {
+        self.programs.release(program);
+    }
+
+    fn own_program(&self, id: c_uint) -> Program {
+        Program {
+            id,
+            owner: Rc::downgrade(&self.programs),
         }
     }
 
@@ -389,5 +536,212 @@ impl Window {
                 pixels.as_ptr().cast(),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    static RELEASED: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+    unsafe extern "C" fn current_context() -> Ptr {
+        core::ptr::dangling_mut()
+    }
+    unsafe extern "C" fn unbind(_: Ptr, _: Ptr, _: Ptr, _: Ptr) -> c_uint {
+        RELEASED.lock().unwrap().push("unbind");
+        1
+    }
+    unsafe extern "C" fn surface(_: Ptr, _: Ptr) -> c_uint {
+        RELEASED.lock().unwrap().push("surface");
+        1
+    }
+    unsafe extern "C" fn context(_: Ptr, _: Ptr) -> c_uint {
+        RELEASED.lock().unwrap().push("context");
+        1
+    }
+    #[test]
+    fn dropping_window_releases_its_egl_surface_and_context() {
+        let mut egl = Egl::test_stub();
+        egl.eglMakeCurrent = unbind;
+        egl.eglGetCurrentContext = current_context;
+        egl.eglDestroySurface = surface;
+        egl.eglDestroyContext = context;
+        let window = Window {
+            programs: Programs::new(&egl, &Gles::test_stub(), core::ptr::dangling_mut()),
+            egl,
+            gl: Gles::test_stub(),
+            dpy: core::ptr::dangling_mut(),
+            surface: core::ptr::dangling_mut(),
+            context: core::ptr::dangling_mut(),
+            w: 1,
+            h: 1,
+        };
+        drop(window);
+        assert_eq!(*RELEASED.lock().unwrap(), ["unbind", "surface", "context"]);
+        RELEASED.lock().unwrap().clear();
+        let mut egl = Egl::test_stub();
+        egl.eglDestroyContext = context;
+        // No surface and no current context: the context-only failure path.
+        let partial = Window {
+            programs: Programs::new(&egl, &Gles::test_stub(), core::ptr::dangling_mut()),
+            egl,
+            gl: Gles::test_stub(),
+            dpy: core::ptr::dangling_mut(),
+            surface: core::ptr::null_mut(),
+            context: core::ptr::dangling_mut(),
+            w: 1,
+            h: 1,
+        };
+        drop(partial);
+        assert_eq!(*RELEASED.lock().unwrap(), ["context"]);
+    }
+}
+
+#[cfg(test)]
+mod program_tests {
+    use super::*;
+    #[derive(Default)]
+    struct State {
+        next: u32,
+        fail: u32,
+        shaders: Vec<u32>,
+        programs: Vec<u32>,
+        detached: Vec<(u32, u32)>,
+        events: Vec<&'static str>,
+    }
+    thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
+    unsafe extern "C" fn shader(_: u32) -> u32 {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.next += 1;
+            if s.fail == 4 && s.next == 2 {
+                0
+            } else {
+                s.next
+            }
+        })
+    }
+    unsafe extern "C" fn shader_status(id: u32, _: u32, out: *mut i32) {
+        let ok = STATE.with(|s| {
+            let s = s.borrow();
+            !(s.fail == 1 && id == 1 || s.fail == 2 && id == 2)
+        });
+        // SAFETY: the library supplies its status output pointer.
+        unsafe {
+            *out = i32::from(ok);
+        }
+    }
+    unsafe extern "C" fn program() -> u32 {
+        STATE.with(|s| if s.borrow().fail == 5 { 0 } else { 3 })
+    }
+    unsafe extern "C" fn program_status(_: u32, _: u32, out: *mut i32) {
+        let ok = STATE.with(|s| s.borrow().fail != 3);
+        // SAFETY: the library supplies its status output pointer.
+        unsafe {
+            *out = i32::from(ok);
+        }
+    }
+    unsafe extern "C" fn delete_shader(id: u32) {
+        STATE.with(|s| s.borrow_mut().shaders.push(id));
+    }
+    unsafe extern "C" fn delete_program(id: u32) {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.programs.push(id);
+            s.events.push("program");
+        });
+    }
+    unsafe extern "C" fn detach(p: u32, s: u32) {
+        STATE.with(|state| state.borrow_mut().detached.push((p, s)));
+    }
+    unsafe extern "C" fn current() -> Ptr {
+        core::ptr::dangling_mut()
+    }
+    unsafe extern "C" fn unbind(_: Ptr, _: Ptr, _: Ptr, _: Ptr) -> u32 {
+        STATE.with(|s| s.borrow_mut().events.push("unbind"));
+        1
+    }
+    unsafe extern "C" fn destroy(_: Ptr, _: Ptr) -> u32 {
+        STATE.with(|s| s.borrow_mut().events.push("context"));
+        1
+    }
+    fn window() -> Window {
+        let mut window = Window::test_window();
+        window.gl.glCreateShader = shader;
+        window.gl.glGetShaderiv = shader_status;
+        window.gl.glDeleteShader = delete_shader;
+        window.gl.glCreateProgram = program;
+        window.gl.glGetProgramiv = program_status;
+        window.gl.glDeleteProgram = delete_program;
+        window.gl.glDetachShader = detach;
+        window.programs = Programs::new(&window.egl, &window.gl, window.context);
+        window
+    }
+    #[test]
+    fn compilation_and_link_failures_release_every_allocation() {
+        for fail in 0..=5 {
+            STATE.with(|s| {
+                *s.borrow_mut() = State {
+                    fail,
+                    ..State::default()
+                }
+            });
+            let window = window();
+            let result = window.program(c"vertex", c"fragment");
+            assert_eq!(result.is_ok(), fail == 0);
+            if let Ok(id) = result {
+                window.delete_program(id);
+                window.delete_program(id);
+            }
+            STATE.with(|s| {
+                let s = s.borrow();
+                let mut shaders = s.shaders.clone();
+                shaders.sort_unstable();
+                assert_eq!(
+                    shaders,
+                    if fail == 1 || fail == 4 {
+                        vec![1]
+                    } else {
+                        vec![1, 2]
+                    },
+                    "case {fail}"
+                );
+                assert_eq!(
+                    s.programs,
+                    if fail == 0 || fail == 3 {
+                        vec![3]
+                    } else {
+                        vec![]
+                    },
+                    "case {fail}"
+                );
+                assert_eq!(s.detached.len(), if fail == 0 { 2 } else { 0 });
+            });
+        }
+    }
+    #[test]
+    fn dropping_the_renderer_releases_its_program_in_the_live_context() {
+        STATE.with(|s| *s.borrow_mut() = State::default());
+        let window = window();
+        let renderer = yuv::Yuv420::new(&window).unwrap();
+        assert_eq!(window.programs.ids.borrow().len(), 1);
+        drop(renderer);
+        assert!(window.programs.ids.borrow().is_empty());
+        STATE.with(|s| assert_eq!(s.borrow().programs, [3]));
+    }
+    #[test]
+    fn remaining_programs_are_deleted_before_unbinding_the_context() {
+        STATE.with(|s| *s.borrow_mut() = State::default());
+        let mut window = window();
+        window.context = core::ptr::dangling_mut();
+        window.egl.eglGetCurrentContext = current;
+        window.egl.eglMakeCurrent = unbind;
+        window.egl.eglDestroyContext = destroy;
+        window.programs = Programs::new(&window.egl, &window.gl, window.context);
+        let id = window.program(c"vertex", c"fragment").unwrap();
+        let late_owner = window.own_program(id);
+        drop(window);
+        drop(late_owner);
+        STATE.with(|s| assert_eq!(s.borrow().events, ["program", "unbind", "context"]));
     }
 }

@@ -23,20 +23,15 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-// Read a signed decimal prefix and clamp it to a 32-bit integer.
+// Read a complete signed decimal value and clamp it to a 32-bit integer.
 fn decimal_int(text: &str) -> Option<i32> {
-    let text = text.trim_start_matches([' ', '\t']);
+    let text = text.trim_matches([' ', '\t']);
     let sign = usize::from(text.starts_with(['+', '-']));
-    let digits = text
-        .as_bytes()
-        .get(sign..)?
-        .iter()
-        .take_while(|b| b.is_ascii_digit())
-        .count();
-    if digits == 0 {
+    let digits = text.as_bytes().get(sign..)?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let parsed = text[..sign + digits].parse::<i64>().unwrap_or_else(|_| {
+    let parsed = text.parse::<i64>().unwrap_or_else(|_| {
         if text.starts_with('-') {
             i64::MIN
         } else {
@@ -46,12 +41,21 @@ fn decimal_int(text: &str) -> Option<i32> {
     Some(parsed.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
 }
 
-/// Read the first matching key as a signed decimal prefix.
+/// Read the first matching key as a complete signed decimal value.
 /// Leading zeroes do not change the number base. An invalid value uses the default.
 pub fn base_int(base: &str, key: &str, default: i32) -> i32 {
-    crate::raw_conf_str(base, key)
-        .and_then(decimal_int)
-        .unwrap_or(default)
+    base_int_checked(base, key, default).unwrap_or(default)
+}
+
+/// Read a decimal value, or use the default when the key is absent.
+///
+/// # Errors
+/// Return the refused text when the complete value is not a signed decimal.
+pub fn base_int_checked<'a>(base: &'a str, key: &str, default: i32) -> Result<i32, &'a str> {
+    match crate::raw_conf_str(base, key) {
+        Some(text) => decimal_int(text).ok_or(text),
+        None => Ok(default),
+    }
 }
 
 pub fn base_feature(base: &str, feature: &str) -> bool {
@@ -106,6 +110,7 @@ impl Snapshot {
         }
         let mut next = self.clone();
         let mut seen = BTreeMap::new();
+        let mut numeric_edits = BTreeMap::new();
         for (key, text) in edits {
             let s = schema::find(key).ok_or_else(|| format!("unsupported setting: {key}"))?;
             if s.readonly {
@@ -135,6 +140,7 @@ impl Snapshot {
             {
                 return Err(format!("value outside supported range: {key}"));
             }
+            numeric_edits.insert(key.as_str(), n);
             if key == "ev_routing" {
                 // EV routing does not select a developer head-unit identity.
                 next.values.insert("sensor_ev_advertise".into(), n);
@@ -150,14 +156,16 @@ impl Snapshot {
             "sensor_ev_advertise",
             "sensor_raw_ev_trip",
         ] {
-            if edits.iter().any(|(k, v)| k == key && v == "1") {
-                if edits.iter().any(|(k, v)| k == "feature.sensor" && v != "1") {
+            if numeric_edits.get(key) == Some(&1) {
+                if edits.iter().any(|(k, _)| k == "feature.sensor")
+                    && next.get("feature.sensor", 0) == 0
+                {
                     return Err("conflicting dependency: feature.sensor".into());
                 }
                 next.values.insert("feature.sensor".into(), 1);
             }
         }
-        if edits.iter().any(|(k, v)| k == "sensor_ev_send" && v == "1")
+        if numeric_edits.get("sensor_ev_send") == Some(&1)
             && next.get("sensor_ev_advertise", 0) == 0
         {
             return Err("enable EV routing integration before sending the model".into());
@@ -186,6 +194,26 @@ mod tests {
     fn edit(key: &str, value: &str) -> (String, String) {
         (key.into(), value.into())
     }
+
+    #[test]
+    fn equivalent_integers_have_identical_dependency_checks() {
+        for spelling in ["1", "01", "+1"] {
+            let mut state = snapshot();
+            state.base = "sensor_ev_advertise=0\n".into();
+            assert!(
+                state.changed(&[edit("sensor_ev_send", spelling)]).is_err(),
+                "{spelling}"
+            );
+            let next = state
+                .changed(&[edit("ev_routing", spelling), edit("feature.sensor", "+1")])
+                .unwrap();
+            assert!(next.feature("sensor"));
+            assert_eq!(next.get("sensor_ev_send", 0), 1);
+            assert!(state
+                .changed(&[edit("ev_routing", spelling), edit("feature.sensor", "00")])
+                .is_err());
+        }
+    }
     #[test]
     fn media_codec_accepts_only_consumer_enum_values() {
         let state = snapshot();
@@ -203,7 +231,7 @@ mod tests {
         assert!(base_feature(base, "cluster"));
         assert!(!base_feature(base, "sensor"));
         assert_eq!(base_int(base, "x", 9), 9);
-        assert_eq!(base_int("x=13tail", "x", 0), 13);
+        assert_eq!(base_int("x=13tail", "x", 9), 9);
         assert_eq!(base_int("x=-9", "x", 0), -9);
     }
     #[test]
@@ -291,13 +319,56 @@ mod decimal_contract {
 
     use super::*;
     #[test]
+    fn complete_decimal_values_preserve_sign_spaces_and_clamping() {
+        for (text, expected) in [
+            ("31", 31),
+            ("-5", -5),
+            (" \t+31 \t", 31),
+            ("-0005", -5),
+            ("2147483648", i32::MAX),
+            ("-2147483649", i32::MIN),
+            ("999999999999999999999999999999", i32::MAX),
+            ("-999999999999999999999999999999", i32::MIN),
+        ] {
+            assert_eq!(decimal_int(text), Some(expected), "{text:?}");
+            assert_eq!(
+                base_int_checked(&format!("x={text}"), "x", 17),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn partial_or_empty_values_return_the_refused_text_and_default() {
+        for text in [
+            "0x1F",
+            "12abc",
+            "",
+            "+",
+            "-",
+            "1 2",
+            "31 # comment",
+            "1.0",
+            "1\t2",
+        ] {
+            let base = format!("x={text}\nx=31");
+            assert_eq!(decimal_int(text), None, "{text:?}");
+            assert_eq!(base_int_checked(&base, "x", 17), Err(text));
+            assert_eq!(base_int(&base, "x", 17), 17);
+            assert_eq!(crate::carplay::base_int(&base, "x", 17), 17);
+        }
+        assert_eq!(base_int_checked("x= \t ", "x", 17), Err(""));
+        assert_eq!(base_int_checked("", "x", 17), Ok(17));
+    }
+
+    #[test]
     fn both_loaders_use_one_decimal_reader() {
         for (text, value) in [
             ("x=010", 10),
             ("x=-020", -20),
             ("x=08", 8),
-            ("x=0x10", 0),
-            ("x=+19tail", 19),
+            ("x=0x10", 7),
+            ("x=+19tail", 7),
             ("x=bad\nx=3", 7),
             ("x =5\nx=9", 5),
             ("#x=12\r\n\tx=17\r", 17),

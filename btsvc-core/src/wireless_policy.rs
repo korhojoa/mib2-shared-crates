@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Allocation-free wireless Android Auto policy parser.
 //! Missing, malformed, expired or future-dated leases never grant access.
-//! The RFCOMM grant authorizes a BT peer; it does not identify a TCP socket.
+//! The RFCOMM grant authorizes a Bluetooth peer. It does not identify a TCP socket.
 
 pub type Address = [u8; 6];
 pub const LEASE_MS: u64 = 10_000;
@@ -179,7 +179,7 @@ pub enum Decline {
     NoPolicy,
     /// The policy does not select and allow this peer.
     NotPermitted,
-    /// Too many failed handshakes; quiet for this many more seconds.
+    /// Too many handshakes failed. Wait this many more seconds before another attempt.
     Cooldown { quiet_s: u64 },
 }
 
@@ -221,8 +221,7 @@ pub struct Incoming<'a> {
     pub cooldown_until_ms: u64,
 }
 
-/// Accept or decline an incoming AAWG channel. The order of the checks is
-/// the order the server used before the reasons were logged.
+/// Accept or decline an incoming AAWG channel. Busy state takes precedence over permission.
 #[must_use]
 pub fn admit(i: &Incoming) -> Admit {
     if i.channel_up {
@@ -469,7 +468,7 @@ mod tests {
                 after_cooldown: false
             }
         );
-        // Busy wins over permission, as before the reasons were logged.
+        // Busy state takes precedence over permission.
         assert_eq!(
             admit(&Incoming {
                 channel_up: true,
@@ -487,7 +486,7 @@ mod tests {
         assert!(matches!(t.after_recovery(Some(a), false), Resume::Skip(_)));
         t.start(a);
         assert_eq!(t.after_recovery(Some(a), false), Resume::Nudge(a));
-        // One decision per recovery; the attempt stays open until it ends.
+        // Each recovery has one decision. The attempt stays open until it ends.
         assert_eq!(t.after_recovery(Some(a), false), Resume::Nudge(a));
         assert!(matches!(t.after_recovery(Some(a), true), Resume::Skip(_)));
         assert!(matches!(t.after_recovery(Some(b), false), Resume::Skip(_)));

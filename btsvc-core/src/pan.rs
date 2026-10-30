@@ -84,7 +84,7 @@ pub fn ipv4_source(frame: &[u8]) -> Option<[u8; 4]> {
 }
 
 /// If `frame` is an ARP reply for `target_ip` (i.e. from the probed host),
-/// return the responder's MAC - the stage-1 "link is alive both ways" proof.
+/// return the responder's MAC address.
 #[must_use]
 pub fn arp_reply_from(frame: &[u8], target_ip: [u8; 4]) -> Option<[u8; 6]> {
     let h = parse_eth_header(frame)?;
@@ -159,7 +159,7 @@ fn build_dhcp(
         ip[2..4].copy_from_slice(&ip_len.to_be_bytes());
         ip[8] = 64; // ttl
         ip[9] = 17; // udp
-                    // src 0.0.0.0 already; dst broadcast:
+                    // The source is 0.0.0.0. The destination is the broadcast address.
         ip[16..20].fill(0xff);
         let csum = ip_checksum(&ip[..IP_HDR]);
         ip[10..12].copy_from_slice(&csum.to_be_bytes());
@@ -198,7 +198,7 @@ fn build_dhcp(
     out[o + 3] = 3;
     out[o + 4] = 6;
     o += 5;
-    // (55 has len 3 -> wrote 5 bytes; opt_len accounted 6 incl. one pad)
+    // Option 55 uses five bytes. The allocated six bytes include one padding byte.
     o += 1;
     if let Some((ip, server)) = req {
         out[o] = 50; // requested ip
@@ -237,8 +237,7 @@ pub struct DhcpReply {
     pub server_id: [u8; 4],
     pub router: Option<[u8; 4]>,
     pub netmask: Option<[u8; 4]>,
-    /// First server from option 6 (we request it in option 55; stage 2's
-    /// resolver needs it - phones hand out their own tether address here).
+    /// First DNS server from DHCP option 6. The request includes it in option 55.
     pub dns: Option<[u8; 4]>,
     /// Option 51, seconds. A phone tether hands out SHORT leases and stops
     /// forwarding for an address whose lease lapsed - renew at T1 (half).
@@ -258,10 +257,21 @@ pub fn parse_dhcp_reply(frame: &[u8], xid: u32, our_mac: &[u8; 6]) -> Option<Dhc
         return None;
     }
     let ihl = ((ip[0] & 0x0f) as usize) * 4;
+    let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+    let fragment = u16::from_be_bytes([ip[6], ip[7]]);
+    if ihl < IP_HDR || total < ihl + UDP_HDR || fragment & 0x3fff != 0 {
+        return None;
+    }
+    let ip = ip.get(..total)?;
     let udp = ip.get(ihl..)?;
     if udp.len() < UDP_HDR {
         return None;
     }
+    let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
+    if udp_len < UDP_HDR {
+        return None;
+    }
+    let udp = udp.get(..udp_len)?;
     let dst_port = (u16::from(udp[2]) << 8) | u16::from(udp[3]);
     if dst_port != 68 {
         return None;
@@ -288,8 +298,8 @@ pub fn parse_dhcp_reply(frame: &[u8], xid: u32, our_mac: &[u8; 6]) -> Option<Dhc
         lease_secs: None,
     };
     let mut o = BOOTP_FIXED + 4;
-    while o + 1 < b.len() {
-        let (code, len) = (b[o], b[o + 1] as usize);
+    while o < b.len() {
+        let code = b[o];
         if code == 255 {
             break;
         }
@@ -297,6 +307,7 @@ pub fn parse_dhcp_reply(frame: &[u8], xid: u32, our_mac: &[u8; 6]) -> Option<Dhc
             o += 1;
             continue; // pad
         }
+        let len = usize::from(*b.get(o + 1)?);
         let val = b.get(o + 2..o + 2 + len)?;
         match (code, len) {
             (53, 1) => reply.msg_type = val[0],
@@ -390,9 +401,18 @@ mod tests {
         buf[bootp_offset + 255..bootp_offset + 261].copy_from_slice(&[6, 4, 10, 74, 7, 7]); // dns
         buf[bootp_offset + 261..bootp_offset + 267].copy_from_slice(&[51, 4, 0, 0, 0x0e, 0x10]); // lease 3600
         buf[bootp_offset + 267] = 255;
-        // options grew past the DISCOVER-sized frame; the parser bounds on
-        // the slice, not the IP length field, and buf has room
+        // Extend both declared lengths to contain the reply options.
         let packet_len = packet_len + 13;
+        buf[16..18].copy_from_slice(
+            &u16::try_from(packet_len - ETH_HDR_LEN)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        buf[38..40].copy_from_slice(
+            &u16::try_from(packet_len - ETH_HDR_LEN - IP_HDR)
+                .unwrap()
+                .to_be_bytes(),
+        );
         let reply = parse_dhcp_reply(&buf[..packet_len], 0x1234_5678, &MAC).unwrap();
         assert_eq!(reply.msg_type, 2);
         assert_eq!(reply.your_ip, [192, 168, 44, 17]);
@@ -400,6 +420,31 @@ mod tests {
         assert_eq!(reply.router, Some([192, 168, 44, 1]));
         assert_eq!(reply.dns, Some([10, 74, 7, 7]));
         assert_eq!(reply.lease_secs, Some(3600));
+        for (offset, value) in [
+            (16, 19u16),
+            (16, 28),
+            (16, 399),
+            (38, 7),
+            (38, 399),
+            (20, 0x2000),
+            (20, 1),
+        ] {
+            let mut invalid = buf;
+            invalid[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+            assert!(
+                parse_dhcp_reply(&invalid[..packet_len], 0x1234_5678, &MAC).is_none(),
+                "offset {offset} value {value}"
+            );
+        }
+        let mut padding = buf;
+        padding[16..18].copy_from_slice(&u16::try_from(20 + 8 + 240).unwrap().to_be_bytes());
+        assert!(parse_dhcp_reply(&padding[..packet_len], 0x1234_5678, &MAC).is_none());
+        padding = buf;
+        padding[38..40].copy_from_slice(&u16::try_from(8 + 240).unwrap().to_be_bytes());
+        assert!(parse_dhcp_reply(&padding[..packet_len], 0x1234_5678, &MAC).is_none());
+        padding = buf;
+        padding[14] = 0x44;
+        assert!(parse_dhcp_reply(&padding[..packet_len], 0x1234_5678, &MAC).is_none());
         // wrong xid / wrong mac -> not ours
         assert!(parse_dhcp_reply(&buf[..packet_len], 0x1111_1111, &MAC).is_none());
         assert!(parse_dhcp_reply(&buf[..packet_len], 0x1234_5678, &[9; 6]).is_none());

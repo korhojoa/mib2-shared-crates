@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (C) mib2-shared-crates contributors
-//! Shared implementation of the existing native MPE encoder event observer.
+//! Observe native MPE encoder events and publish bounded PPS state.
 //! One owned reader consumes native log events without an independent service.
 //! Event fields identify encoder state and stream markers.
 use std::collections::BTreeMap;
@@ -13,16 +13,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// Native slog category for encoder events.
 pub const MAJOR: u32 = 43690;
 const MAX_TEXT: usize = 1020;
 const MAX_AGE_MS: u64 = 500;
 static PROCESS_START: OnceLock<u64> = OnceLock::new();
 static INSTANCE: AtomicU64 = AtomicU64::new(0);
 
+/// Classification of one encoder log message.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Seen<'a> {
+    /// Bytes after the selected marker prefix.
     Mark(&'a [u8]),
+    /// Encoder enabled state: true for enabled, false for closed.
     State(bool),
+    /// No encoder state or selected marker in this message.
     Nothing,
 }
 /// Stop classification at the first NUL byte.
@@ -48,9 +53,12 @@ pub fn classify<'a>(text: &'a [u8], prefix: &[u8]) -> Seen<'a> {
     Seen::Nothing
 }
 
+/// Cached state from a sequence of complete native slog events.
 #[derive(Default)]
 pub struct Decoder {
+    /// Last known encoder state, or None after a malformed event.
     pub level: Option<bool>,
+    /// Last marker value observed in the selected category.
     pub mark: String,
 }
 impl Decoder {
@@ -100,12 +108,17 @@ impl Decoder {
     }
 }
 
+/// Native event source, PPS destination and caller callbacks.
 pub struct Config {
+    /// Absolute PPS object path. This must not be a regular file.
+    /// One non-truncating write replaces PPS attributes, not file bytes.
     pub object: PathBuf,
     /// Includes the separating space, for example "encmark ".
     pub prefix: String,
     /// Absolute monotonic milliseconds, shared with the native timer origin.
     pub clock: fn() -> u64,
+    /// Publish the supplied marker in the native encoder slog category.
+    /// Return true only after successful publication.
     pub emit_marker: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     /// Consumer logger must timestamp the supplied line.
     pub log: fn(&str),
@@ -139,9 +152,12 @@ impl Drop for Service {
         }
     }
 }
+/// Shared reader service. The last handle stops and joins its owned worker.
 #[derive(Clone)]
 pub struct Observer(Arc<Service>);
 impl Observer {
+    /// Open the native slog source and start one owned reader.
+    /// Returns an I/O error if the source, destination or worker is unavailable.
     pub fn start(config: Config) -> io::Result<Self> {
         #[cfg(target_os = "nto")]
         const NONBLOCK: i32 = 0o200;
@@ -200,6 +216,7 @@ impl Observer {
             worker: Mutex::new(Some(worker)),
         })))
     }
+    /// Whether the reader is healthy, caught up and has a fresh heartbeat.
     pub fn ready(&self) -> bool {
         let inner = &self.0.inner;
         let Ok(state) = inner.state.lock() else {
@@ -239,6 +256,7 @@ impl Observer {
             state.expected.clear();
         }
     }
+    /// Stop and join the reader shared by all handles. Repeated calls are permitted.
     pub fn stop(&self) {
         self.0.inner.stop.store(true, Ordering::Release);
         if let Ok(mut worker) = self.0.worker.lock() {
@@ -247,6 +265,8 @@ impl Observer {
             }
         }
     }
+    /// Read a fresh encoder state for this process and the active marker generation.
+    /// Returns None without a healthy reader and a matching PPS record.
     pub fn level(&self) -> Option<bool> {
         if !self.ready() {
             return None;
@@ -431,7 +451,7 @@ mod tests {
         bytes
     }
     #[test]
-    fn retained_original_classifier_vectors() {
+    fn classifies_encoder_state_and_marker_fields() {
         assert_eq!(
             classify(b"galmark 1234.5\0\0", b"galmark "),
             Seen::Mark(b"1234.5")

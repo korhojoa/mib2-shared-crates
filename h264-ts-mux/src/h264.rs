@@ -92,6 +92,7 @@ struct BitR<'a> {
     b: &'a [u8],
     nbits: usize,
     pos: usize,
+    failed: bool,
 }
 
 impl<'a> BitR<'a> {
@@ -100,10 +101,15 @@ impl<'a> BitR<'a> {
             nbits: b.len() * 8,
             b,
             pos: 0,
+            failed: false,
         }
     }
-    /// Return zero bits after the end of the input.
+    /// Refuse a field beyond the input or the integer width.
     fn u(&mut self, k: u32) -> u32 {
+        if k > 32 || k as usize > self.nbits.saturating_sub(self.pos) {
+            self.failed = true;
+            return 0;
+        }
         let mut v: u32 = 0;
         for _ in 0..k {
             let bit = self
@@ -116,17 +122,18 @@ impl<'a> BitR<'a> {
         v
     }
     fn ue(&mut self) -> u32 {
-        let mut z = 0u32;
-        while self.pos < self.nbits && self.u(1) == 0 {
-            z += 1;
+        let mut zeros = 0;
+        loop {
+            if self.pos >= self.nbits || zeros == 32 {
+                self.failed = true;
+                return u32::MAX;
+            }
+            if self.u(1) != 0 {
+                break;
+            }
+            zeros += 1;
         }
-        let v = if z < 32 { (1u32 << z) - 1 } else { 0xFFFF_FFFF };
-        if z != 0 {
-            // Add with wrapping arithmetic for an oversized input value.
-            v.wrapping_add(self.u(z))
-        } else {
-            v
-        }
+        ((1u32 << zeros) - 1).wrapping_add(self.u(zeros))
     }
     fn se(&mut self) -> i32 {
         let k = self.ue();
@@ -159,7 +166,7 @@ fn deemul(input: &[u8], out: &mut [u8]) -> usize {
 }
 
 /// Everything the skip generator needs, parsed once from the SPS/PPS.
-/// Defaults supply the initial SPS and PPS parameters before stream parsing.
+/// Defaults are inactive until a supported SPS and PPS have been parsed.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "these ARE the SPS/PPS flag bits; the slice-header writer reads each one independently"
@@ -176,7 +183,7 @@ pub struct H264 {
     /// omitting it misaligns everything that follows, and the decoder reports a
     /// invalid `cabac_init_idc`. The bit must match the active PPS.
     pub pic_order_present: bool,
-    /// SPS `pic_order_cnt_type`: 0 (`CarPlay`) or 2 (the probe's animation frames).
+    /// SPS `pic_order_cnt_type`: 0 uses an explicit picture-order count. Type 2 derives it.
     /// Decides whether a slice header carries `pic_order_cnt_lsb` at all.
     pub poc_type: u32,
     have_sps: bool,
@@ -184,6 +191,13 @@ pub struct H264 {
     /// Last real slice's `frame_num`, and the POC the filler continues from.
     pub last_fn: u32,
     pub fill_poc: u32,
+}
+
+fn has_chroma_fields(profile: u32) -> bool {
+    matches!(
+        profile,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    )
 }
 
 impl H264 {
@@ -214,8 +228,12 @@ impl Default for H264 {
     }
 }
 
+/// Maximum supported picture size in macroblocks. This bounds filler work.
+pub const MAX_PIC_MBS: i32 = 65_536;
+
 impl H264 {
     fn parse_sps(&mut self, nal: &[u8]) {
+        self.have_sps = false;
         let mut rb = [0u8; 80];
         let m = deemul(nal, &mut rb);
         // `deemul` bounds m to the buffer length. Use a checked slice so
@@ -224,14 +242,13 @@ impl H264 {
         let prof = r.u(8);
         r.u(8);
         r.u(8);
-        r.ue();
-        if matches!(prof, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128) {
-            let cf = r.ue();
-            if cf == 3 {
-                r.u(1);
+        if r.ue() != 0 {
+            return;
+        } // Only SPS zero is supported.
+        if has_chroma_fields(prof) {
+            if r.ue() != 1 || r.ue() != 0 || r.ue() != 0 {
+                return;
             }
-            r.ue();
-            r.ue();
             r.u(1);
             if r.u(1) != 0 {
                 self.have_sps = false; // scaling matrix: bail
@@ -244,10 +261,8 @@ impl H264 {
         // pic_order_cnt_type. Two of the three are usable and they need
         // different slice headers:
         //
-        //   0 - the CarPlay stream. pic_order_cnt_lsb is written explicitly.
-        //   2 - what x264 picks for the probe's own animation frames, because
-        //       they are encoded with no B-frames. POC is DERIVED from
-        //       frame_num, so the slice header carries no POC field at all.
+        //   0 - pic_order_cnt_lsb is present in the slice header.
+        //   2 - picture order derives from frame_num. No POC field is present.
         //   1 - would need delta_pic_order_cnt[]; nothing here produces it.
         //
         // Types 0 and 2 have supported skip-slice headers.
@@ -266,31 +281,45 @@ impl H264 {
             self.have_sps = false; // frame_mbs_only only
             return;
         }
-        self.pic_mbs = wmbs.wrapping_mul(hmap).cast_signed();
+        let Some(mbs) = wmbs.checked_mul(hmap).and_then(|n| i32::try_from(n).ok()) else {
+            return;
+        };
+        if r.failed
+            || !(4..=16).contains(&self.log2_fn)
+            || (self.poc_type == 0 && !(4..=16).contains(&self.log2_poc))
+            || !(1..=MAX_PIC_MBS).contains(&mbs)
+        {
+            return;
+        }
+        self.pic_mbs = mbs;
         self.have_sps = true;
     }
 
     fn parse_pps(&mut self, nal: &[u8]) {
+        self.have_pps = false;
         let mut rb = [0u8; 64];
         let m = deemul(nal, &mut rb);
         let mut r = BitR::new(rb.get(..m).unwrap_or(&[])); // see parse_sps
-        r.ue();
-        r.ue(); // pps_id, sps_id
+        if r.ue() != 0 || r.ue() != 0 {
+            return;
+        } // PPS zero refers to SPS zero.
         let ent = r.u(1);
         self.pic_order_present = r.u(1) != 0;
         if r.ue().wrapping_add(1) != 1 {
             self.have_pps = false; // num_slice_groups
             return;
         }
-        r.ue();
-        r.ue(); // num_ref_idx l0, l1
-        r.u(1);
-        r.u(2); // weighted pred/bipred
+        // The generated P header has one default reference and no weight table.
+        if r.ue() != 0 || r.ue() != 0 || r.u(1) != 0 || r.u(2) != 0 {
+            return;
+        }
         self.pic_qp = r.se().wrapping_add(26); // pic_init_qp
         r.se();
         r.se(); // qs, chroma offset
         self.deblock_pres = r.u(1) != 0;
-        if ent != 1 {
+        r.u(1); // constrained_intra_pred_flag does not change a P skip slice.
+        let redundant = r.u(1);
+        if ent != 1 || redundant != 0 || r.failed || !(0..=51).contains(&self.pic_qp) {
             self.have_pps = false; // CABAC required
             return;
         }
@@ -303,8 +332,11 @@ impl H264 {
         let mut r = BitR::new(rb.get(..m).unwrap_or(&[])); // see parse_sps
         r.ue();
         r.ue();
-        r.ue(); // first_mb, type, pps_id
-        self.last_fn = r.u(self.log2_fn);
+        if r.ue() != 0 {
+            self.have_pps = false;
+            return;
+        }
+        let frame_num = r.u(self.log2_fn);
         if nal_type == 5 {
             r.ue(); // idr_pic_id
         }
@@ -312,7 +344,15 @@ impl H264 {
         // derived from frame_num, so there is nothing here to resync to and
         // reading log2_poc bits would consume whatever followed instead.
         if self.poc_type == 0 {
-            self.fill_poc = r.u(self.log2_poc);
+            let poc = r.u(self.log2_poc);
+            if !r.failed {
+                self.fill_poc = poc;
+            }
+        }
+        if r.failed {
+            self.have_pps = false;
+        } else {
+            self.last_fn = frame_num;
         }
     }
 
@@ -391,11 +431,19 @@ impl BitW {
         self.nbits += 1;
     }
     fn u(&mut self, v: u32, k: u32) {
+        if k > 32 {
+            self.ovf = true;
+            return;
+        }
         for i in (0..k).rev() {
             self.bit((v >> i) & 1);
         }
     }
     fn ue(&mut self, v: u32) {
+        if v == u32::MAX {
+            self.ovf = true;
+            return;
+        }
         let x = v.wrapping_add(1);
         // Limit the shift count to less than the integer width.
         let mut n = 0u32;
@@ -530,7 +578,7 @@ impl Cabac {
 
 /// Build a non-reference all-skip P access unit (Annex-B) into `out`.
 /// Returns the byte count, or 0 on failure (buffer too small, or the slice
-/// outgrew the bit writer).
+/// outgrew the bit writer, or parameter sets are not supported and ready).
 ///
 /// Generate a non-reference frame with picture-order count type zero.
 pub fn build_skip_au(out: &mut [u8], frame_num: u32, poc: u32, h: &H264) -> usize {
@@ -539,27 +587,29 @@ pub fn build_skip_au(out: &mut [u8], frame_num: u32, poc: u32, h: &H264) -> usiz
 
 /// As above, but the caller chooses `nal_ref_idc`.
 ///
-/// WHY THE REFERENCE VARIANT EXISTS, and it is a real constraint rather than a
-/// convenience. Under **`poc_type` 0** (the `CarPlay` stream) a filler must be
-/// NON-reference: it then leaves `frame_num` alone, stays out of the reference
-/// lists, and the phone's real P-chain is untouched. That is the shim's case.
-///
-/// Under **`poc_type` 2** (the probe's own animation frames) POC is DERIVED from
-/// `frame_num`, so a run of non-reference skips would all share one `frame_num` and
-/// therefore derive one identical POC -- several distinct pictures claiming the
-/// same output position, which is not a legal stream and would confound the very
-/// measurement the filler test exists to make. So in that case the probe emits
-/// REFERENCE skips with an advancing `frame_num`: distinct, increasing, legal.
-///
-/// That is safe here and only here, because the probe generates the entire
-/// stream -- there is no foreign reference chain to disturb, and the next active
-/// phase opens with an IDR, which resets `frame_num` anyway. Do NOT copy this
-/// into the shim: there the phone owns the chain.
+/// With picture-order count type 0, non-reference filler preserves the source reference chain.
+/// With type 2, picture order derives from `frame_num`.
+/// Distinct reference pictures require advancing frame numbers in that mode.
+/// The caller must own the reference chain before it inserts reference filler.
+/// `ref_idc` zero selects non-reference filler. Values 1 through 3 select reference filler.
+/// Other values return zero and leave the output unchanged.
 #[allow(
     clippy::many_single_char_names,
     reason = "short local names describe bit coding state and image dimensions"
 )]
 pub fn build_skip_au_ref(out: &mut [u8], frame_num: u32, poc: u32, h: &H264, ref_idc: u8) -> usize {
+    if ref_idc > 3
+        || !(4..=16).contains(&h.log2_fn)
+        || (h.poc_type == 0 && !(4..=16).contains(&h.log2_poc))
+        || !matches!(h.poc_type, 0 | 2)
+        || !(1..=MAX_PIC_MBS).contains(&h.pic_mbs)
+        || !(0..=51).contains(&h.pic_qp)
+    {
+        return 0;
+    }
+    if !h.ready || !h.have_sps || !h.have_pps {
+        return 0;
+    }
     let mut w = BitW::new();
     w.ue(0); // first_mb_in_slice
     w.ue(5); // slice_type = P
@@ -598,6 +648,9 @@ pub fn build_skip_au_ref(out: &mut [u8], frame_num: u32, poc: u32, h: &H264, ref
     for i in 0..h.pic_mbs {
         c.skip(&mut w);
         c.term(&mut w, i == h.pic_mbs.wrapping_sub(1));
+        if w.ovf {
+            return 0;
+        }
     }
     while w.nbits & 7 != 0 {
         w.bit(0);
@@ -608,13 +661,13 @@ pub fn build_skip_au_ref(out: &mut [u8], frame_num: u32, poc: u32, h: &H264, ref
     let rbsp = w.nbits >> 3;
 
     // start code, then the NAL header: nal_ref_idc in bits 6:5, type = 1
-    // (non-IDR slice). ref_idc 0 is the shim's non-reference filler; the probe
-    // passes 2 for a reference skip under poc_type 2.
+    // (non-IDR slice). ref_idc zero selects a non-reference picture.
+    // A nonzero value selects a reference picture.
     let head: &mut [u8; 5] = match out.get_mut(..5).and_then(|s| s.try_into().ok()) {
         Some(h) => h,
         None => return 0, // caller buffer too small for even the header
     };
-    *head = [0, 0, 0, 1, ((ref_idc & 0x03) << 5) | 0x01];
+    *head = [0, 0, 0, 1, (ref_idc << 5) | 0x01];
     escape(&w.buf[..rbsp], out, 5)
 }
 
@@ -683,10 +736,7 @@ fn crop_chroma_and_order(r: &mut BitR<'_>) -> Result<(u32, bool), CropError> {
     r.ue(); // seq_parameter_set_id
     let mut chroma = 1u32;
     let mut separate = false;
-    if matches!(
-        profile,
-        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
-    ) {
+    if has_chroma_fields(profile) {
         chroma = r.ue();
         if chroma == 3 {
             separate = r.u(1) != 0;
@@ -837,13 +887,16 @@ mod tests {
 
     /// H.264 parameter set from a decoded CarPlay stream.
     /// It contains codec fields only, with no device or person identifiers.
-    const CARPLAY_SPS: &[u8] = &[
+    pub(super) const CARPLAY_SPS: &[u8] = &[
         0x27, 0x64, 0x00, 0x1f, 0xac, 0x13, 0x14, 0x50, 0x32, 0x0f, 0x69, 0xb8, 0x08, 0x68, 0x30,
         0x36, 0x82, 0x21, 0x19, 0x60,
     ];
 
     fn h_with(poc_type: u32) -> H264 {
         H264 {
+            ready: true,
+            have_sps: true,
+            have_pps: true,
             poc_type,
             log2_fn: 12,
             log2_poc: 13,
@@ -933,6 +986,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reference_identifier_matches_the_header_or_is_refused() {
+        for poc_type in [0, 2] {
+            let h = h_with(poc_type);
+            for ref_idc in 0..=3 {
+                let mut out = [0u8; 4096];
+                let n = build_skip_au_ref(&mut out, 3, 7, &h, ref_idc);
+                assert!(n > 0);
+                assert_eq!(out[4], (ref_idc << 5) | 1);
+                let mut rb = [0u8; 64];
+                let m = deemul(&out[5..n.min(45)], &mut rb);
+                let mut r = BitR::new(&rb[..m]);
+                assert_eq!(r.ue(), 0);
+                assert_eq!(r.ue(), 5);
+                assert_eq!(r.ue(), 0);
+                assert_eq!(r.u(h.log2_fn), 3);
+                if poc_type == 0 {
+                    assert_eq!(r.u(h.log2_poc), 7);
+                }
+                assert_eq!(r.u(1), 0);
+                assert_eq!(r.u(1), 0);
+                if ref_idc != 0 {
+                    assert_eq!(r.u(1), 0);
+                }
+                assert_eq!(r.ue(), 0, "cabac_init_idc");
+                assert_eq!(r.se(), 0, "slice_qp_delta");
+                assert_eq!(r.ue(), 1, "disable_deblocking_filter_idc");
+            }
+            for ref_idc in 4..=u8::MAX {
+                let mut out = [0xa5u8; 4096];
+                assert_eq!(
+                    build_skip_au_ref(&mut out, 3, 7, &h, ref_idc),
+                    0,
+                    "poc_type={poc_type}, ref_idc={ref_idc}"
+                );
+                assert_eq!(out, [0xa5u8; 4096]);
+            }
+        }
+    }
+
     /// Emulation prevention: no 00 00 0x sequence may survive in the payload, or
     /// a demuxer resynchronises mid-slice on a false start code.
     #[test]
@@ -960,13 +1053,11 @@ mod tests {
         }
     }
 
-    /// A slice beyond the writer capacity must be refused rather than clipped.
+    /// A picture beyond the work limit must be refused before encoding.
     #[test]
-    fn a_slice_past_the_writer_is_refused() {
-        // 600000 macroblocks exceeds the measured capacity of 587908.
-        // This bounds the failure test on slower targets.
+    fn a_picture_above_the_work_limit_is_refused() {
         let mut h = h_with(0);
-        h.pic_mbs = 600_000;
+        h.pic_mbs = MAX_PIC_MBS + 1;
         let mut out = [0u8; 4096];
         assert_eq!(
             build_skip_au(&mut out, 0, 0, &h),
@@ -999,14 +1090,17 @@ mod tests {
         }
     }
 
-    /// The real `CarPlay` SPS must parse to the values the car reported, so a
+    /// The real `CarPlay` SPS must parse to the expected geometry, so a
     /// regression in the parser shows up here rather than as a dead cluster.
     #[test]
     fn the_real_carplay_sps_parses_to_the_measured_values() {
         let mut h = H264::default();
         h.observe(&[&[0u8, 0, 0, 1][..], CARPLAY_SPS].concat());
         assert_eq!(h.poc_type, 0, "CarPlay uses pic_order_cnt_type 0");
-        assert_eq!(h.log2_fn, 12, "log2_max_frame_num, as logged on the car");
+        assert_eq!(
+            h.log2_fn, 12,
+            "log2_max_frame_num, from the parameter-set fixture"
+        );
         assert_eq!(h.log2_poc, 13, "log2_max_pic_order_cnt_lsb");
         assert_eq!(h.pic_mbs, 1500, "800x480 = 50x30 macroblocks");
     }
@@ -1107,31 +1201,159 @@ mod tests {
 }
 
 #[cfg(test)]
-mod threshold_probe {
+mod capacity_tests {
     use super::*;
 
-    /// Not a test -- a measuring tool, kept because the number it finds is what
-    /// keeps `a_slice_past_the_writer_is_refused` cheap on the Pi. Re-run it with
-    /// `cargo test --release find_overflow_threshold -- --ignored --nocapture`
-    /// if the bit writer or the CABAC coder ever changes.
-    #[test]
-    #[ignore = "a measuring tool, not a test: binary-searches the bit-writer overflow threshold; run by hand as the doc comment says"]
-    fn find_overflow_threshold() {
-        let mut lo = 1_000i32;
-        let mut hi = 20_000_000i32;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let h = H264 {
-                pic_mbs: mid,
-                ..H264::default()
-            };
-            let mut out = [0u8; 4096];
-            if build_skip_au(&mut out, 0, 0, &h) == 0 {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
+    fn pps(pps_id: u32, sps_id: u32, refs: u32, weighted: bool, redundant: bool) -> BitW {
+        let mut w = BitW::new();
+        w.ue(pps_id);
+        w.ue(sps_id);
+        w.bit(1);
+        w.bit(0);
+        w.ue(0);
+        w.ue(refs);
+        w.ue(0);
+        w.bit(u32::from(weighted));
+        w.u(0, 2);
+        w.se(0);
+        w.se(0);
+        w.se(0);
+        w.bit(1);
+        w.bit(0);
+        w.bit(u32::from(redundant));
+        w.bit(1);
+        while w.nbits & 7 != 0 {
+            w.bit(0);
         }
-        println!("smallest pic_mbs that overflows: {lo}");
+        w
+    }
+    #[test]
+    fn filler_requires_the_exact_parameter_syntax_it_emits() {
+        let mut h = H264::new();
+        h.parse_sps(&super::tests::CARPLAY_SPS[1..]);
+        assert!(h.have_sps);
+        for args in [
+            (0, 0, 0, false, false),
+            (1, 0, 0, false, false),
+            (0, 1, 0, false, false),
+            (0, 0, 1, false, false),
+            (0, 0, 0, true, false),
+            (0, 0, 0, false, true),
+        ] {
+            let w = pps(args.0, args.1, args.2, args.3, args.4);
+            h.parse_pps(&w.buf[..w.nbits / 8]);
+            h.ready = h.have_sps && h.have_pps;
+            let valid = args == (0, 0, 0, false, false);
+            assert_eq!(h.ready, valid, "{args:?}");
+            assert_eq!(build_skip_au(&mut [0u8; 4096], 1, 1, &h) > 0, valid);
+        }
+        let valid = pps(0, 0, 0, false, false);
+        h.parse_pps(&valid.buf[..valid.nbits / 8]);
+        assert!(h.have_pps);
+        let mut slice = BitW::new();
+        slice.ue(0);
+        slice.ue(0);
+        slice.ue(1);
+        slice.u(0, h.log2_fn);
+        h.track_slice(&slice.buf[..slice.nbits.div_ceil(8)], 1);
+        assert!(!h.have_pps);
+        h.parse_pps(&[]);
+        assert!(!h.have_pps);
+    }
+    #[test]
+    fn invalid_widths_and_unbounded_work_are_refused_before_output() {
+        let mut out = [0x55; 64];
+        for width in [0, 3, 17, 33, u32::MAX] {
+            let mut h = H264::new();
+            h.ready = true;
+            h.have_sps = true;
+            h.have_pps = true;
+            h.log2_fn = width;
+            assert_eq!(build_skip_au(&mut out, 0, 0, &h), 0);
+            assert_eq!(out, [0x55; 64]);
+        }
+        for count in [i32::MIN, -1, 0, MAX_PIC_MBS + 1, i32::MAX] {
+            let mut h = H264::new();
+            h.ready = true;
+            h.have_sps = true;
+            h.have_pps = true;
+            h.pic_mbs = count;
+            assert_eq!(build_skip_au(&mut out, 0, 0, &h), 0);
+            assert_eq!(out, [0x55; 64]);
+        }
+        let mut w = BitW::new();
+        w.u(0, 33);
+        assert!(w.ovf);
+        let mut r = BitR::new(&[0; 80]);
+        assert_eq!(r.ue(), u32::MAX);
+        assert!(r.failed);
+        assert!(r.pos <= 32);
+        for fn_width in [13, u32::MAX] {
+            let mut w = BitW::new();
+            w.u(66, 8);
+            w.u(0, 8);
+            w.u(30, 8);
+            w.ue(0);
+            w.ue(fn_width);
+            w.ue(2);
+            w.ue(1);
+            w.bit(0);
+            w.ue(49);
+            w.ue(29);
+            w.bit(1);
+            let mut h = H264::new();
+            h.ready = true;
+            h.have_sps = true;
+            h.have_pps = true;
+            h.parse_sps(&w.buf[..w.nbits.div_ceil(8)]);
+            assert!(!h.have_sps);
+        }
+    }
+    #[test]
+    fn sps_profile_fields_preserve_baseline_and_high_profile_geometry() {
+        for profile in [
+            66, 77, 100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135,
+        ] {
+            let mut bits = BitW::new();
+            bits.u(profile, 8);
+            bits.u(0, 8);
+            bits.u(30, 8);
+            bits.ue(0);
+            if ![66, 77].contains(&profile) {
+                bits.ue(1);
+                bits.ue(0);
+                bits.ue(0);
+                bits.bit(0);
+                bits.bit(0);
+            }
+            bits.ue(8);
+            bits.ue(0);
+            bits.ue(9);
+            bits.ue(1);
+            bits.bit(0);
+            bits.ue(49);
+            bits.ue(29);
+            bits.bit(1);
+            bits.bit(1);
+            bits.bit(0);
+            bits.bit(0);
+            bits.bit(1);
+            while bits.nbits & 7 != 0 {
+                bits.bit(0);
+            }
+            let payload = &bits.buf[..bits.nbits / 8];
+            let mut parsed = H264::default();
+            parsed.parse_sps(payload);
+            assert!(parsed.have_sps, "profile {profile}");
+            assert_eq!(
+                (parsed.log2_fn, parsed.log2_poc, parsed.pic_mbs),
+                (12, 13, 1500),
+                "profile {profile}"
+            );
+            assert_eq!(
+                crop_chroma_and_order(&mut BitR::new(payload)),
+                Ok((1, false))
+            );
+        }
     }
 }
