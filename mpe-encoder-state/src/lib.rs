@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Copyright (C) mib2-shared-crates contributors
+// Copyright (C) 2026 korhojoa
 //! Observe native MPE encoder events and publish bounded PPS state.
 //! One owned reader consumes native log events without an independent service.
 //! Event fields identify encoder state and stream markers.

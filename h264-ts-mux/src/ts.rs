@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Copyright (C) mib2-shared-crates contributors
+// Copyright (C) 2026 korhojoa
 
 //! MPEG-TS packet and block construction for the MOST video channel.
 //!

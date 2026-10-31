@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Copyright (C) mib2-shared-crates contributors
+// Copyright (C) 2026 korhojoa
 
 //! H.264 bit reader, parameter-set parser and CABAC skip-slice generator.
 //!
